@@ -86,6 +86,33 @@ forge script script/DesplegarPagoAtomicoMXNB.s.sol \
 
 `--verify` publica el código en Arbiscan. Después, pon la dirección desplegada en `CONTRATO_PAGOS` del backend.
 
+## Despliegue desde GitHub Actions
+
+El workflow [`Desplegar en Arbitrum Sepolia`](../.github/workflows/desplegar-sepolia.yml) despliega el contrato en la testnet sin instalar nada en tu computadora. Solo se puede lanzar desde `main` y ejecuta los tests antes de desplegar.
+
+### Configuración (una sola vez)
+
+1. Crea una wallet **nueva y exclusiva para testnet** y consíguele ETH de Arbitrum Sepolia en un faucet. No reutilices una clave de mainnet.
+2. En el repositorio, ve a **Settings → Environments → New environment** y crea `arbitrum-sepolia`.
+3. Dentro del environment, en **Environment secrets**, añade:
+
+   | Secret | Valor |
+   |--------|-------|
+   | `DEPLOYER_PRIVATE_KEY` | Clave privada de la wallet del paso 1 (`0x...`). |
+   | `ARBITRUM_SEPOLIA_RPC_URL` | URL de RPC de Arbitrum Sepolia (Alchemy, Infura, etc.). |
+   | `ETHERSCAN_API_KEY` | Opcional: clave de [Etherscan](https://etherscan.io/apis) para verificar el código en Arbiscan. |
+
+4. Opcional: en el environment, activa **Required reviewers** para que cada despliegue necesite tu aprobación.
+
+### Lanzarlo
+
+1. **Actions → Desplegar en Arbitrum Sepolia → Run workflow** (rama `main`).
+2. Rellena tesorería, operador (la dirección de `OPERADOR_PRIVATE_KEY` del backend), owner y comisión.
+3. Al terminar, el resumen del job muestra la dirección del contrato con enlaces a Arbiscan. El registro del despliegue queda como artefacto `despliegue-arbitrum-sepolia`.
+4. En el backend, pon `ARBITRUM_TESTNET=1` y `CONTRATO_PAGOS=<dirección>`.
+
+Para mainnet, despliega a mano con el owner en un multisig y después de la auditoría.
+
 ## Antes de producción
 
 - Owner en un **multisig**, no en una wallet individual.

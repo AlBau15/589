@@ -1,0 +1,120 @@
+name: Desplegar en Arbitrum Sepolia
+
+# Se lanza a mano desde la pestaña Actions. Despliega PagoAtomicoMXNB en Arbitrum Sepolia (testnet).
+# Secrets del environment "arbitrum-sepolia" (ver docs/contrato.md#despliegue-desde-github-actions):
+#   DEPLOYER_PRIVATE_KEY      clave que paga el gas del despliegue (solo testnet, con ETH de Sepolia)
+#   ARBITRUM_SEPOLIA_RPC_URL  URL de RPC de Arbitrum Sepolia
+#   ETHERSCAN_API_KEY         opcional: verifica el código en Arbiscan
+
+on:
+  workflow_dispatch:
+    inputs:
+      tesoreria:
+        description: Wallet que recibe la comisión (0x...)
+        required: true
+      operador:
+        description: Dirección de OPERADOR_PRIVATE_KEY del backend, la que firma las órdenes (0x...)
+        required: true
+      owner:
+        description: Administrador del contrato, idealmente un multisig (0x...)
+        required: true
+      comision_bps:
+        description: Comisión en puntos básicos (500 = 5 %, máximo 3000)
+        required: true
+        default: "500"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desplegar-sepolia
+  cancel-in-progress: false
+
+jobs:
+  desplegar:
+    name: desplegar
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: arbitrum-sepolia
+    env:
+      # Proxy de MXNB en Arbitrum Sepolia (el mismo que usa src/chain.js con ARBITRUM_TESTNET=1)
+      MXNB_ADDRESS: "0x82B9e52b26A2954E113F94Ff26647754d5a4247D"
+      TESORERIA_ADDRESS: ${{ inputs.tesoreria }}
+      OPERADOR_ADDRESS: ${{ inputs.operador }}
+      OWNER_ADDRESS: ${{ inputs.owner }}
+      COMISION_BPS: ${{ inputs.comision_bps }}
+    steps:
+      - name: Validar parámetros
+        run: |
+          set -euo pipefail
+          for nombre in TESORERIA_ADDRESS OPERADOR_ADDRESS OWNER_ADDRESS; do
+            valor="${!nombre}"
+            if [[ ! "$valor" =~ ^0x[0-9a-fA-F]{40}$ ]] || [[ "$valor" =~ ^0x0{40}$ ]]; then
+              echo "::error::$nombre no es una dirección válida: $valor"
+              exit 1
+            fi
+          done
+          if [[ ! "$COMISION_BPS" =~ ^[0-9]+$ ]] || (( COMISION_BPS > 3000 )); then
+            echo "::error::comision_bps debe ser un entero entre 0 y 3000: $COMISION_BPS"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.6
+
+      - name: Tests antes de desplegar
+        run: forge test
+
+      - name: Desplegar
+        env:
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DEPLOYER_PRIVATE_KEY" || -z "$ARBITRUM_SEPOLIA_RPC_URL" ]]; then
+            echo "::error::Faltan los secrets DEPLOYER_PRIVATE_KEY o ARBITRUM_SEPOLIA_RPC_URL en el environment arbitrum-sepolia"
+            exit 1
+          fi
+          verificar=()
+          if [[ -n "$ETHERSCAN_API_KEY" ]]; then
+            verificar=(--verify --etherscan-api-key "$ETHERSCAN_API_KEY")
+          else
+            echo "::warning::Sin ETHERSCAN_API_KEY: el contrato se despliega sin verificar en Arbiscan"
+          fi
+          forge script script/DesplegarPagoAtomicoMXNB.s.sol \
+            --rpc-url "$ARBITRUM_SEPOLIA_RPC_URL" \
+            --private-key "$DEPLOYER_PRIVATE_KEY" \
+            --broadcast "${verificar[@]}"
+
+      - name: Resumen
+        run: |
+          set -euo pipefail
+          registro=broadcast/DesplegarPagoAtomicoMXNB.s.sol/421614/run-latest.json
+          direccion=$(jq -r '[.transactions[] | select(.transactionType == "CREATE")][0].contractAddress' "$registro")
+          tx=$(jq -r '[.transactions[] | select(.transactionType == "CREATE")][0].hash' "$registro")
+          {
+            echo "## PagoAtomicoMXNB desplegado en Arbitrum Sepolia"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Contrato | [\`$direccion\`](https://sepolia.arbiscan.io/address/$direccion) |"
+            echo "| Transacción | [\`$tx\`](https://sepolia.arbiscan.io/tx/$tx) |"
+            echo "| Owner | \`$OWNER_ADDRESS\` |"
+            echo "| Operador | \`$OPERADOR_ADDRESS\` |"
+            echo "| Tesorería | \`$TESORERIA_ADDRESS\` |"
+            echo "| Comisión | $COMISION_BPS bps |"
+            echo ""
+            echo "En el backend: \`ARBITRUM_TESTNET=1\` y \`CONTRATO_PAGOS=$direccion\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: despliegue-arbitrum-sepolia
+          path: broadcast/DesplegarPagoAtomicoMXNB.s.sol/421614/run-latest.json

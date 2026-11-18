@@ -98,11 +98,13 @@ El workflow [`Desplegar en Arbitrum Sepolia`](../.github/workflows/desplegar-sep
 
    | Secret | Valor |
    |--------|-------|
-   | `DEPLOYER_PRIVATE_KEY` | Clave privada de la wallet del paso 1 (`0x...`). |
-   | `ARBITRUM_SEPOLIA_RPC_URL` | URL de RPC de Arbitrum Sepolia (Alchemy, Infura, etc.). |
+   | `DEPLOYER_PRIVATE_KEY` | Clave privada de la wallet del paso 1 (64 caracteres hexadecimales, con o sin `0x`). |
+   | `ARBITRUM_SEPOLIA_RPC_URL` | URL de RPC de Arbitrum Sepolia, **completa y empezando por `https://`** (p. ej. `https://arb-sepolia.g.alchemy.com/v2/<tu-clave>` o la pública `https://sepolia-rollup.arbitrum.io/rpc`). Sin comillas. |
    | `ETHERSCAN_API_KEY` | Opcional: clave de [Etherscan](https://etherscan.io/apis) para verificar el código en Arbiscan. |
 
 4. Opcional: en el environment, activa **Required reviewers** para que cada despliegue necesite tu aprobación.
+
+Antes de desplegar, el workflow comprueba que la RPC responde y es Arbitrum Sepolia (chain id 421614) y que la wallet tiene ETH, y si algo falla lo dice con un mensaje claro.
 
 ### Lanzarlo
 

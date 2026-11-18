@@ -8,6 +8,7 @@ Bienvenido a la documentación del proyecto **589**.
 |-----------|-------------|
 | [Guía de inicio](guia-de-inicio.md) | Requisitos, instalación y primeros pasos. |
 | [Arquitectura](arquitectura.md) | Visión general de la estructura y los componentes del proyecto. |
+| [Contrato](contrato.md) | Roles, ciclo de una orden, garantías, tests y despliegue de `PagoAtomicoMXNB`. |
 
 ## Cómo contribuir a la documentación
 

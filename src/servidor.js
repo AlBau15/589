@@ -36,6 +36,9 @@ async function autenticar(req, res, next) {
   }
 }
 
+// Tiempo que tiene el comprador para pagar una orden antes de que caduque en el contrato
+const VIGENCIA_ORDEN_SEGUNDOS = BigInt(process.env.ORDEN_VIGENCIA_SEGUNDOS ?? 900);
+
 const limitador = rateLimit({ windowMs: 60_000, limit: 10, keyGenerator: (req) => req.userId ?? ipKeyGenerator(req.ip ?? '') });
 const comunes = { autenticar, limitador };
 
@@ -64,9 +67,10 @@ app.post(
     }
 
     const orderId = crypto.randomBytes(16).toString('hex');
+    const expiraEn = BigInt(Math.floor(Date.now() / 1000)) + VIGENCIA_ORDEN_SEGUNDOS;
     await db.guardarOrden({ orderId, userId: req.userId, itemId, monto: item.monto, comprador, creador });
     try {
-      await chain.crearOrdenOnchain({ orderId, comprador, creador, monto: item.monto });
+      await chain.crearOrdenOnchain({ orderId, comprador, creador, monto: item.monto, expiraEn });
     } catch (error) {
       await db.marcarOrdenCancelada(orderId);
       throw error;
@@ -76,6 +80,7 @@ app.post(
       exito: true,
       orderId,
       monto: deMicro(item.monto),
+      expiraEn: new Date(Number(expiraEn) * 1000).toISOString(),
       calls: chain.callsPago({ orderId, monto: item.monto }),
     });
   })
@@ -104,7 +109,10 @@ async function reconciliarOrdenes() {
   for (const orderId of await db.ordenesPendientesAntiguas(60)) {
     const estado = await chain.estadoOrden(orderId);
     if (estado.pagada) await alPagarOrden({ orderId, txHash: null });
-    else if (estado.cancelada) await db.marcarOrdenCancelada(orderId);
+    // Una orden caducada ya no se puede pagar en el contrato, así que se da por cancelada.
+    else if (estado.cancelada || BigInt(Math.floor(Date.now() / 1000)) >= estado.expiraEn) {
+      await db.marcarOrdenCancelada(orderId);
+    }
   }
 }
 

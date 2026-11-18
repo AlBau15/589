@@ -28,6 +28,10 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 ├── .env.example              # Plantilla de configuración
 ├── contracts/
 │   └── PagoAtomicoMXNB.sol   # Contrato de pago atómico con reparto
+├── lib/                      # Submódulos: OpenZeppelin y forge-std
+├── script/                   # Script de despliegue (Foundry)
+├── test/contracts/           # Tests del contrato (Foundry)
+├── foundry.toml              # Configuración de Foundry
 ├── db/
 │   └── schema.sql            # Esquema PostgreSQL (v2.1)
 ├── docs/                     # Esta documentación
@@ -92,15 +96,17 @@ Se arrancan en `servidor.js` salvo que `EJECUTAR_TRABAJADORES=0`:
 | `retiros-mx` | 10 s | Pide a Juno la redención SPEI de los retiros `en_juno`. |
 | `salidas-us` | 15 s | Envía el USDC convertido a la liquidation address de Bridge. |
 | `retiros-bitso` | 30 s | En modo `bitso_api`, consulta en Bitso el tx hash de cada envío y lo guarda para que el webhook de Bridge pueda cerrar el lote. Si Bitso reporta el retiro como fallido, marca el lote `fallido` para revisión manual. |
-| `reconciliar-ordenes` | 30 s | Consulta en cadena las órdenes `creada` de hace más de 60 s. |
+| `reconciliar-ordenes` | 30 s | Consulta en cadena las órdenes `creada` de hace más de 60 s: las marca como pagadas, o como canceladas si se cancelaron o caducaron. |
 
 Además, `vigilarCompras` escucha `CompraConfirmada` para marcar órdenes pagadas al instante.
 
 ## Contrato `PagoAtomicoMXNB`
 
-- El **operador** (backend) crea órdenes con comprador, creador y monto fijos. La comisión se congela al crear la orden.
-- Solo el **comprador** de la orden puede pagarla. La orden se marca como pagada antes de mover fondos, y `nonReentrant` evita la reentrada.
-- El **owner** (idealmente un multisig, con `Ownable2Step`) puede cambiar tesorería, operador y comisión, y pausar el contrato.
+- El **operador** (backend) crea órdenes con comprador, creador, monto y caducidad fijos. La comisión se congela al crear la orden y no puede superar el 30 %.
+- Solo el **comprador** de la orden puede pagarla, y solo antes de que caduque. La orden se marca como pagada antes de mover fondos, y `nonReentrant` evita la reentrada.
+- El **owner** (idealmente un multisig, con `Ownable2Step`) puede cambiar tesorería, operador y comisión, pausar el contrato y rescatar tokens enviados por error. No puede renunciar a la administración.
+
+Detalles, tests y despliegue en [Contrato](contrato.md).
 
 ## Direcciones de tokens
 

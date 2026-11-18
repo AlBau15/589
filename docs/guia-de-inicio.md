@@ -11,14 +11,14 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
   - **Juno / Bitso** (Mint Platform: CLABEs, emisión, redención, conversión y retiros).
   - **Bridge** (liquidation address en Arbitrum hacia una cuenta ACH).
 - Un nodo RPC de Arbitrum One o Arbitrum Sepolia.
-- Hardhat o Foundry para desplegar el contrato.
+- [Foundry](https://getfoundry.sh) para compilar, probar y desplegar el contrato.
 
 ## Instalación
 
 1. Clona el repositorio:
 
    ```bash
-   git clone https://github.com/albau15/589.git
+   git clone --recurse-submodules https://github.com/albau15/589.git
    cd 589
    ```
 
@@ -35,15 +35,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
    psql pagos -f db/schema.sql
    ```
 
-4. Despliega `contracts/PagoAtomicoMXNB.sol` (requiere `@openzeppelin/contracts` v5). Parámetros del constructor:
-
-   | Parámetro | Valor |
-   |-----------|-------|
-   | `mxnb_` | Proxy de MXNB (ver tabla de direcciones en [arquitectura](arquitectura.md#direcciones-de-tokens)) |
-   | `tesoreria_` | Wallet que recibe la comisión de la plataforma |
-   | `operador_` | Dirección de `OPERADOR_PRIVATE_KEY` (el backend) |
-   | `comisionBps_` | Comisión en puntos básicos (p. ej. `500` = 5 %) |
-   | `owner_` | Administrador, idealmente un multisig |
+4. Despliega `contracts/PagoAtomicoMXNB.sol` con Foundry siguiendo la guía del [contrato](contrato.md#despliegue).
 
 5. Copia la configuración y rellénala:
 
@@ -65,6 +57,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 | `ARBITRUM_TESTNET` | `1` para Arbitrum Sepolia. |
 | `CONTRATO_PAGOS` | Dirección del contrato `PagoAtomicoMXNB` desplegado. |
 | `OPERADOR_PRIVATE_KEY` | Clave del operador que llama a `crearOrden`. |
+| `ORDEN_VIGENCIA_SEGUNDOS` | Tiempo para pagar una orden antes de que caduque en el contrato (por defecto `900`). |
 | `MXNB_ADDRESS`, `USDC_ADDRESS` | Opcionales: sobrescriben las direcciones de los tokens. |
 | `JUNO_BASE_URL`, `JUNO_ENTORNO` | Host de Juno y entorno (`stage` / `production`) para la lista de IPs de webhooks. |
 | `JUNO_API_KEY`, `JUNO_API_SECRET` | Credenciales HMAC de Juno/Bitso. |

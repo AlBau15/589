@@ -26,3 +26,22 @@ jobs:
 
       - name: Comprobar sintaxis
         run: npm run check
+
+  contrato:
+    name: contrato
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.6
+
+      - name: Compilar
+        run: forge build --sizes
+
+      - name: Tests
+        run: forge test -vvv

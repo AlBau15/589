@@ -14,11 +14,13 @@ contract PagoAtomicoMXNBTest is Test {
     PagoAtomicoMXNB internal pago;
 
     address internal owner = makeAddr("owner");
-    address internal operador = makeAddr("operador");
+    address internal operador;
+    uint256 internal operadorPk;
     address internal tesoreria = makeAddr("tesoreria");
     address internal comprador = makeAddr("comprador");
     address internal creador = makeAddr("creador");
-    address internal atacante = makeAddr("atacante");
+    address internal atacante;
+    uint256 internal atacantePk;
 
     uint16 internal constant COMISION = 500; // 5 %
     uint128 internal constant MONTO = 1_000_000_000; // 1,000 MXNB
@@ -27,6 +29,8 @@ contract PagoAtomicoMXNBTest is Test {
 
     function setUp() public {
         vm.warp(1_700_000_000);
+        (operador, operadorPk) = makeAddrAndKey("operador");
+        (atacante, atacantePk) = makeAddrAndKey("atacante");
         mxnb = new MXNBMock();
         pago = new PagoAtomicoMXNB(IERC20(address(mxnb)), tesoreria, operador, COMISION, owner);
         mxnb.mint(comprador, 10_000_000_000); // 10,000 MXNB
@@ -34,19 +38,34 @@ contract PagoAtomicoMXNBTest is Test {
 
     // ───────────── Ayudas ─────────────
 
-    function _expira() internal view returns (uint64) {
-        return uint64(block.timestamp) + VIGENCIA;
+    function _orden(bytes16 id, uint128 monto) internal view returns (PagoAtomicoMXNB.Orden memory) {
+        return PagoAtomicoMXNB.Orden({
+            orderId: id,
+            comprador: comprador,
+            creador: creador,
+            monto: monto,
+            comisionBps: pago.comisionBps(),
+            expiraEn: uint64(block.timestamp) + VIGENCIA
+        });
     }
 
-    function _crear(bytes16 id, uint128 monto) internal {
-        vm.prank(operador);
-        pago.crearOrden(id, comprador, creador, monto, _expira());
+    function _firmar(uint256 pk, PagoAtomicoMXNB.Orden memory o) internal view returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, pago.hashOrden(o));
+        return abi.encodePacked(r, s, v);
     }
 
-    function _pagar(bytes16 id, uint256 aprobado) internal {
-        vm.startPrank(comprador);
-        mxnb.approve(address(pago), aprobado);
-        pago.pagarOrden(id);
+    function _pagar(PagoAtomicoMXNB.Orden memory o, bytes memory firma) internal {
+        vm.startPrank(o.comprador);
+        mxnb.approve(address(pago), o.monto);
+        pago.pagarOrden(o, firma);
+        vm.stopPrank();
+    }
+
+    function _esperarRevert(PagoAtomicoMXNB.Orden memory o, bytes memory firma, bytes4 error_) internal {
+        vm.startPrank(o.comprador);
+        mxnb.approve(address(pago), o.monto);
+        vm.expectRevert(error_);
+        pago.pagarOrden(o, firma);
         vm.stopPrank();
     }
 
@@ -77,81 +96,81 @@ contract PagoAtomicoMXNBTest is Test {
         new PagoAtomicoMXNB(IERC20(address(mxnb)), tesoreria, operador, maximo + 1, owner);
     }
 
-    // ───────────── crearOrden ─────────────
+    // ───────────── EIP-712 ─────────────
 
-    function test_CrearOrden_GuardaYEmite() public {
-        uint64 expira = _expira();
-        vm.expectEmit(true, true, true, true, address(pago));
-        emit PagoAtomicoMXNB.OrdenCreada(ORDEN, comprador, creador, MONTO, COMISION, expira);
-
-        vm.prank(operador);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, expira);
-
-        (address c, address cr, uint128 m, uint16 bps, bool pagada, bool cancelada, uint64 exp) = pago.ordenes(ORDEN);
-        assertEq(c, comprador);
-        assertEq(cr, creador);
-        assertEq(m, MONTO);
-        assertEq(bps, COMISION);
-        assertFalse(pagada);
-        assertFalse(cancelada);
-        assertEq(exp, expira);
+    /// El digest se calcula aquí a mano, sin usar el contrato, según la especificación EIP-712.
+    function test_HashOrden_SigueLaEspecificacionEIP712() public view {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes32 dominio = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("PagoAtomicoMXNB"),
+                keccak256("1"),
+                block.chainid,
+                address(pago)
+            )
+        );
+        bytes32 estructura = keccak256(
+            abi.encode(
+                keccak256(
+                    "Orden(bytes16 orderId,address comprador,address creador,uint128 monto,uint16 comisionBps,uint64 expiraEn)"
+                ),
+                o.orderId,
+                o.comprador,
+                o.creador,
+                o.monto,
+                o.comisionBps,
+                o.expiraEn
+            )
+        );
+        assertEq(pago.hashOrden(o), keccak256(abi.encodePacked("\x19\x01", dominio, estructura)));
     }
 
-    function test_CrearOrden_SoloOperador() public {
-        uint64 expira = _expira();
-        vm.prank(atacante);
-        vm.expectRevert(PagoAtomicoMXNB.NoAutorizado.selector);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, expira);
-    }
+    /// Vector generado con src/firmas.js (ver test/backend/firmas.test.js): demuestra que el contrato
+    /// acepta exactamente la firma que produce el backend.
+    function test_VectorFirmaBackend() public {
+        // Clave pública de pruebas (anvil #0). NUNCA usarla en producción.
+        address operadorVector = 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266;
+        address contratoVector = address(0xC0FFEE01);
+        address compradorVector = address(0xaaaa);
+        address creadorVector = address(0xbbbb);
 
-    function test_CrearOrden_RevierteConDireccionCero() public {
-        uint64 expira = _expira();
-        vm.startPrank(operador);
-        vm.expectRevert(PagoAtomicoMXNB.DireccionInvalida.selector);
-        pago.crearOrden(ORDEN, address(0), creador, MONTO, expira);
-        vm.expectRevert(PagoAtomicoMXNB.DireccionInvalida.selector);
-        pago.crearOrden(ORDEN, comprador, address(0), MONTO, expira);
+        vm.chainId(42161);
+        deployCodeTo(
+            "PagoAtomicoMXNB.sol:PagoAtomicoMXNB",
+            abi.encode(IERC20(address(mxnb)), tesoreria, operadorVector, uint16(500), owner),
+            contratoVector
+        );
+        PagoAtomicoMXNB contrato = PagoAtomicoMXNB(contratoVector);
+
+        PagoAtomicoMXNB.Orden memory o = PagoAtomicoMXNB.Orden({
+            orderId: 0x000102030405060708090a0b0c0d0e0f,
+            comprador: compradorVector,
+            creador: creadorVector,
+            monto: 1_000_000_000,
+            comisionBps: 500,
+            expiraEn: 2_000_000_000
+        });
+        bytes memory firma =
+            hex"617f747b01144290ee99c8b636a4b9781be59e72b1492d7d1449d587656ec05c0bd2e32802e241e8cfc3d88b806456b0b9f4bb954ee0b70c8f656916991adbe41b";
+
+        assertEq(contrato.hashOrden(o), 0x1e198ee1b2200e43b5382e95dea448732eeaf78d7a9f9b180b1f756007d71464);
+
+        mxnb.mint(compradorVector, o.monto);
+        vm.startPrank(compradorVector);
+        mxnb.approve(contratoVector, o.monto);
+        contrato.pagarOrden(o, firma);
         vm.stopPrank();
-    }
 
-    function test_CrearOrden_RevierteConMontoCero() public {
-        uint64 expira = _expira();
-        vm.prank(operador);
-        vm.expectRevert(PagoAtomicoMXNB.MontoInvalido.selector);
-        pago.crearOrden(ORDEN, comprador, creador, 0, expira);
-    }
-
-    function test_CrearOrden_RevierteConCaducidadPasadaOActual() public {
-        uint64 ahora = uint64(block.timestamp);
-        vm.startPrank(operador);
-        vm.expectRevert(PagoAtomicoMXNB.CaducidadInvalida.selector);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, ahora);
-        vm.expectRevert(PagoAtomicoMXNB.CaducidadInvalida.selector);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, ahora - 1);
-        vm.stopPrank();
-    }
-
-    function test_CrearOrden_RevierteSiYaExiste() public {
-        _crear(ORDEN, MONTO);
-        uint64 expira = _expira();
-        vm.prank(operador);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenExistente.selector);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, expira);
-    }
-
-    function test_CrearOrden_RevierteEnPausa() public {
-        vm.prank(owner);
-        pago.pausar();
-        uint64 expira = _expira();
-        vm.prank(operador);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
-        pago.crearOrden(ORDEN, comprador, creador, MONTO, expira);
+        assertEq(mxnb.balanceOf(creadorVector), 950_000_000);
+        assertEq(uint8(contrato.estados(o.orderId)), uint8(PagoAtomicoMXNB.Estado.Pagada));
     }
 
     // ───────────── pagarOrden ─────────────
 
     function test_PagarOrden_RepartePagoYEmite() public {
-        _crear(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
         uint256 plataforma = (uint256(MONTO) * COMISION) / 10_000; // 50 MXNB
         uint256 parteCreador = MONTO - plataforma; // 950 MXNB
         uint256 saldoInicial = mxnb.balanceOf(comprador);
@@ -162,103 +181,139 @@ contract PagoAtomicoMXNBTest is Test {
         vm.expectEmit(true, true, true, true, address(pago));
         emit PagoAtomicoMXNB.CompraConfirmada(ORDEN, comprador, creador, MONTO, parteCreador, plataforma);
         vm.prank(comprador);
-        pago.pagarOrden(ORDEN);
+        pago.pagarOrden(o, firma);
 
         assertEq(mxnb.balanceOf(creador), parteCreador);
         assertEq(mxnb.balanceOf(tesoreria), plataforma);
         assertEq(mxnb.balanceOf(comprador), saldoInicial - MONTO);
         assertEq(mxnb.balanceOf(address(pago)), 0);
         assertEq(mxnb.allowance(comprador, address(pago)), 0);
-
-        (,,,, bool pagada,,) = pago.ordenes(ORDEN);
-        assertTrue(pagada);
+        assertEq(uint8(pago.estados(ORDEN)), uint8(PagoAtomicoMXNB.Estado.Pagada));
     }
 
     function test_PagarOrden_SinComisionTodoAlCreador() public {
         vm.prank(owner);
         pago.setComisionBps(0);
-        _crear(ORDEN, MONTO);
-        _pagar(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        _pagar(o, _firmar(operadorPk, o));
         assertEq(mxnb.balanceOf(creador), MONTO);
         assertEq(mxnb.balanceOf(tesoreria), 0);
     }
 
-    function test_PagarOrden_UsaLaComisionCongelada() public {
-        _crear(ORDEN, MONTO);
-        vm.prank(owner);
-        pago.setComisionBps(2_000);
-        _pagar(ORDEN, MONTO);
-        assertEq(mxnb.balanceOf(tesoreria), (uint256(MONTO) * COMISION) / 10_000);
+    function test_PagarOrden_RevierteConFirmaDeOtraClave() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        _esperarRevert(o, _firmar(atacantePk, o), PagoAtomicoMXNB.FirmaInvalida.selector);
     }
 
-    function test_PagarOrden_RevierteSiNoExiste() public {
-        vm.prank(comprador);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenInexistente.selector);
-        pago.pagarOrden(ORDEN);
+    function test_PagarOrden_RevierteSiSeAlteraLaOrden() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+
+        PagoAtomicoMXNB.Orden memory alterada = o;
+        alterada.monto = 1; // el comprador intenta pagar menos
+        _esperarRevert(alterada, firma, PagoAtomicoMXNB.FirmaInvalida.selector);
+
+        alterada = _orden(ORDEN, MONTO);
+        alterada.creador = atacante; // alguien intenta desviar el pago
+        _esperarRevert(alterada, firma, PagoAtomicoMXNB.FirmaInvalida.selector);
+
+        alterada = _orden(ORDEN, MONTO);
+        alterada.expiraEn += 1 days; // alguien intenta alargar la vigencia
+        _esperarRevert(alterada, firma, PagoAtomicoMXNB.FirmaInvalida.selector);
+    }
+
+    function test_PagarOrden_RevierteConFirmaMalFormada() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        _esperarRevert(o, hex"1234", PagoAtomicoMXNB.FirmaInvalida.selector);
+        _esperarRevert(o, new bytes(65), PagoAtomicoMXNB.FirmaInvalida.selector);
+    }
+
+    function test_PagarOrden_FirmaDelOperadorAnteriorDejaDeValer() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+        vm.prank(owner);
+        pago.setOperador(makeAddr("nuevoOperador"));
+        _esperarRevert(o, firma, PagoAtomicoMXNB.FirmaInvalida.selector);
+    }
+
+    function test_PagarOrden_FirmaDeOtroContratoNoVale() public {
+        PagoAtomicoMXNB otro = new PagoAtomicoMXNB(IERC20(address(mxnb)), tesoreria, operador, COMISION, owner);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(operadorPk, otro.hashOrden(o));
+        _esperarRevert(o, abi.encodePacked(r, s, v), PagoAtomicoMXNB.FirmaInvalida.selector);
     }
 
     function test_PagarOrden_SoloElComprador() public {
-        _crear(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
         mxnb.mint(atacante, MONTO);
         vm.startPrank(atacante);
         mxnb.approve(address(pago), MONTO);
         vm.expectRevert(PagoAtomicoMXNB.CompradorInvalido.selector);
-        pago.pagarOrden(ORDEN);
+        pago.pagarOrden(o, firma);
         vm.stopPrank();
     }
 
     function test_PagarOrden_NoSePuedePagarDosVeces() public {
-        _crear(ORDEN, MONTO);
-        _pagar(ORDEN, MONTO);
-        vm.startPrank(comprador);
-        mxnb.approve(address(pago), MONTO);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenNoPagable.selector);
-        pago.pagarOrden(ORDEN);
-        vm.stopPrank();
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+        _pagar(o, firma);
+        _esperarRevert(o, firma, PagoAtomicoMXNB.OrdenNoPagable.selector);
     }
 
     function test_PagarOrden_RevierteSiEstaCancelada() public {
-        _crear(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
         vm.prank(operador);
         pago.cancelarOrden(ORDEN);
-        vm.startPrank(comprador);
-        mxnb.approve(address(pago), MONTO);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenNoPagable.selector);
-        pago.pagarOrden(ORDEN);
-        vm.stopPrank();
+        _esperarRevert(o, firma, PagoAtomicoMXNB.OrdenNoPagable.selector);
     }
 
     function test_PagarOrden_FuncionaJustoAntesDeCaducar() public {
-        _crear(ORDEN, MONTO);
-        vm.warp(block.timestamp + VIGENCIA - 1);
-        _pagar(ORDEN, MONTO);
-        (,,,, bool pagada,,) = pago.ordenes(ORDEN);
-        assertTrue(pagada);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+        vm.warp(o.expiraEn - 1);
+        _pagar(o, firma);
+        assertEq(uint8(pago.estados(ORDEN)), uint8(PagoAtomicoMXNB.Estado.Pagada));
     }
 
     function test_PagarOrden_RevierteAlCaducar() public {
-        _crear(ORDEN, MONTO);
-        vm.warp(block.timestamp + VIGENCIA);
-        vm.startPrank(comprador);
-        mxnb.approve(address(pago), MONTO);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenExpirada.selector);
-        pago.pagarOrden(ORDEN);
-        vm.stopPrank();
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+        vm.warp(o.expiraEn);
+        _esperarRevert(o, firma, PagoAtomicoMXNB.OrdenExpirada.selector);
+    }
+
+    function test_PagarOrden_RevierteSiCambioLaComision() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
+        vm.prank(owner);
+        pago.setComisionBps(2_000);
+        _esperarRevert(o, firma, PagoAtomicoMXNB.ComisionCambiada.selector);
+    }
+
+    function test_PagarOrden_RevierteConMontoCero() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, 0);
+        _esperarRevert(o, _firmar(operadorPk, o), PagoAtomicoMXNB.MontoInvalido.selector);
+    }
+
+    function test_PagarOrden_RevierteConCreadorCero() public {
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        o.creador = address(0);
+        _esperarRevert(o, _firmar(operadorPk, o), PagoAtomicoMXNB.DireccionInvalida.selector);
     }
 
     function test_PagarOrden_RevierteEnPausa() public {
-        _crear(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
         vm.prank(owner);
         pago.pausar();
-        vm.startPrank(comprador);
-        mxnb.approve(address(pago), MONTO);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
-        pago.pagarOrden(ORDEN);
-        vm.stopPrank();
+        _esperarRevert(o, firma, Pausable.EnforcedPause.selector);
     }
 
     function test_PagarOrden_RevierteSinAllowanceSuficiente() public {
-        _crear(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        bytes memory firma = _firmar(operadorPk, o);
         uint256 parteCreador = MONTO - (uint256(MONTO) * COMISION) / 10_000;
         vm.startPrank(comprador);
         mxnb.approve(address(pago), MONTO - 1);
@@ -271,12 +326,11 @@ contract PagoAtomicoMXNBTest is Test {
                 MONTO - parteCreador
             )
         );
-        pago.pagarOrden(ORDEN);
+        pago.pagarOrden(o, firma);
         vm.stopPrank();
 
         // La reversión deshace todo: la orden sigue pendiente y no se movió dinero.
-        (,,,, bool pagada,,) = pago.ordenes(ORDEN);
-        assertFalse(pagada);
+        assertEq(uint8(pago.estados(ORDEN)), uint8(PagoAtomicoMXNB.Estado.Pendiente));
         assertEq(mxnb.balanceOf(creador), 0);
     }
 
@@ -287,8 +341,8 @@ contract PagoAtomicoMXNBTest is Test {
         vm.prank(owner);
         pago.setComisionBps(bps);
         mxnb.mint(comprador, monto);
-        _crear(ORDEN, monto);
-        _pagar(ORDEN, monto);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, monto);
+        _pagar(o, _firmar(operadorPk, o));
 
         uint256 plataforma = (uint256(monto) * bps) / 10_000;
         assertEq(mxnb.balanceOf(tesoreria), plataforma);
@@ -300,31 +354,30 @@ contract PagoAtomicoMXNBTest is Test {
     // ───────────── cancelarOrden ─────────────
 
     function test_CancelarOrden_MarcaYEmite() public {
-        _crear(ORDEN, MONTO);
         vm.expectEmit(true, false, false, false, address(pago));
         emit PagoAtomicoMXNB.OrdenCancelada(ORDEN);
         vm.prank(operador);
         pago.cancelarOrden(ORDEN);
-        (,,,,, bool cancelada,) = pago.ordenes(ORDEN);
-        assertTrue(cancelada);
+        assertEq(uint8(pago.estados(ORDEN)), uint8(PagoAtomicoMXNB.Estado.Cancelada));
     }
 
     function test_CancelarOrden_SoloOperador() public {
-        _crear(ORDEN, MONTO);
         vm.prank(atacante);
         vm.expectRevert(PagoAtomicoMXNB.NoAutorizado.selector);
         pago.cancelarOrden(ORDEN);
     }
 
-    function test_CancelarOrden_RevierteSiNoExiste() public {
-        vm.prank(operador);
-        vm.expectRevert(PagoAtomicoMXNB.OrdenInexistente.selector);
+    function test_CancelarOrden_RevierteSiYaEstaCancelada() public {
+        vm.startPrank(operador);
         pago.cancelarOrden(ORDEN);
+        vm.expectRevert(PagoAtomicoMXNB.OrdenNoPagable.selector);
+        pago.cancelarOrden(ORDEN);
+        vm.stopPrank();
     }
 
     function test_CancelarOrden_RevierteSiYaEstaPagada() public {
-        _crear(ORDEN, MONTO);
-        _pagar(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        _pagar(o, _firmar(operadorPk, o));
         vm.prank(operador);
         vm.expectRevert(PagoAtomicoMXNB.OrdenNoPagable.selector);
         pago.cancelarOrden(ORDEN);
@@ -355,14 +408,15 @@ contract PagoAtomicoMXNBTest is Test {
     function test_Admin_ActualizaParametros() public {
         address nuevaTesoreria = makeAddr("nuevaTesoreria");
         address nuevoOperador = makeAddr("nuevoOperador");
+        uint16 maximo = pago.COMISION_MAXIMA_BPS();
         vm.startPrank(owner);
         pago.setTesoreria(nuevaTesoreria);
         pago.setOperador(nuevoOperador);
-        pago.setComisionBps(pago.COMISION_MAXIMA_BPS());
+        pago.setComisionBps(maximo);
         vm.stopPrank();
         assertEq(pago.tesoreria(), nuevaTesoreria);
         assertEq(pago.operador(), nuevoOperador);
-        assertEq(pago.comisionBps(), pago.COMISION_MAXIMA_BPS());
+        assertEq(pago.comisionBps(), maximo);
     }
 
     function test_Admin_RevierteConDireccionCero() public {
@@ -390,8 +444,8 @@ contract PagoAtomicoMXNBTest is Test {
         pago.reanudar();
         assertFalse(pago.paused());
         vm.stopPrank();
-        _crear(ORDEN, MONTO);
-        _pagar(ORDEN, MONTO);
+        PagoAtomicoMXNB.Orden memory o = _orden(ORDEN, MONTO);
+        _pagar(o, _firmar(operadorPk, o));
     }
 
     function test_Admin_RenunciaDeshabilitada() public {

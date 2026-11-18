@@ -1,6 +1,6 @@
 # Contrato `PagoAtomicoMXNB`
 
-Contrato de pago en MXNB sobre Arbitrum. El comprador paga una orden en una sola transacción y el contrato reparte el monto entre el creador y la tesorería de la plataforma. El contrato nunca retiene fondos.
+Contrato de pago en MXNB sobre Arbitrum. El backend firma cada orden fuera de la cadena (EIP-712) y el comprador la paga en una sola transacción; el contrato verifica la firma y reparte el monto entre el creador y la tesorería de la plataforma. El contrato nunca retiene fondos.
 
 Código: [`contracts/PagoAtomicoMXNB.sol`](../contracts/PagoAtomicoMXNB.sol) · Tests: [`test/contracts/`](../test/contracts/) · Despliegue: [`script/DesplegarPagoAtomicoMXNB.s.sol`](../script/DesplegarPagoAtomicoMXNB.s.sol)
 
@@ -8,25 +8,47 @@ Código: [`contracts/PagoAtomicoMXNB.sol`](../contracts/PagoAtomicoMXNB.sol) · 
 
 | Rol | Quién | Puede |
 |-----|-------|-------|
-| **Operador** | El backend (`OPERADOR_PRIVATE_KEY`) | Crear y cancelar órdenes. |
+| **Operador** | El backend (`OPERADOR_PRIVATE_KEY`) | Firmar órdenes fuera de la cadena (no envía transacciones ni necesita ETH) y cancelar órdenes firmadas antes de que se paguen. |
 | **Comprador** | La smart wallet fijada en cada orden | Pagar su orden. |
 | **Owner** | Idealmente un multisig (Safe) | Cambiar tesorería, operador y comisión; pausar y reanudar; rescatar tokens enviados por error; transferir la administración en dos pasos. |
 
 ## Ciclo de una orden
 
-1. El operador llama a `crearOrden(orderId, comprador, creador, monto, expiraEn)`. La comisión vigente se congela en la orden.
-2. El comprador envía `approve(contrato, monto)` + `pagarOrden(orderId)` en una sola UserOperation.
-3. El contrato marca la orden como pagada y transfiere `monto − comisión` al creador y la comisión a la tesorería.
+1. El backend arma la orden `{orderId, comprador, creador, monto, comisionBps, expiraEn}` con la comisión vigente del contrato y la firma con la clave del operador ([EIP-712](https://eips.ethereum.org/EIPS/eip-712), dominio `PagoAtomicoMXNB` versión `1`). No hay ninguna transacción.
+2. El comprador envía `approve(contrato, monto)` + `pagarOrden(orden, firma)` en una sola UserOperation, cuyo gas cubre el paymaster.
+3. El contrato verifica la firma, marca el `orderId` como pagado y transfiere `monto − comisión` al creador y la comisión a la tesorería.
 
-Una orden **no se puede pagar** si no existe, ya está pagada, está cancelada, ha caducado (`block.timestamp >= expiraEn`), el contrato está en pausa o quien paga no es el comprador.
+Una orden **no se puede pagar** si:
+
+| Caso | Error |
+|------|-------|
+| Quien paga no es `orden.comprador` | `CompradorInvalido` |
+| `block.timestamp >= orden.expiraEn` | `OrdenExpirada` |
+| El `orderId` ya se pagó o se canceló | `OrdenNoPagable` |
+| La firma no es del operador actual, o se alteró algún campo | `FirmaInvalida` |
+| La comisión del contrato cambió desde que se firmó | `ComisionCambiada` |
+| `monto` es 0 o `creador` es la dirección cero | `MontoInvalido` / `DireccionInvalida` |
+| El contrato está en pausa | `EnforcedPause` |
 
 ## Garantías
 
-- **Caducidad:** cada orden tiene un `expiraEn`. El backend lo fija en `ahora + ORDEN_VIGENCIA_SEGUNDOS` (900 s por defecto) y marca como cancelada en la base de datos una orden que caducó sin pagarse.
-- **Comisión máxima del 30 %** (`COMISION_MAXIMA_BPS = 3000`): ni el constructor ni `setComisionBps` aceptan más. Un cambio de comisión solo afecta a órdenes nuevas.
+- **Firma ligada a este contrato y esta red:** el dominio EIP-712 incluye `chainId` y la dirección del contrato, así que una firma no sirve en otra red ni en otro despliegue.
+- **Sin repetición:** cada `orderId` se puede pagar una sola vez.
+- **Caducidad:** el backend fija `expiraEn = ahora + ORDEN_VIGENCIA_SEGUNDOS` (900 s por defecto) y marca como cancelada en la base de datos una orden que caducó sin pagarse.
+- **Comisión máxima del 30 %** (`COMISION_MAXIMA_BPS = 3000`). La comisión va firmada en la orden y debe coincidir con la vigente al pagar: el creador recibe exactamente el reparto que se le mostró.
+- **Rotación del operador:** `setOperador` invalida al instante todas las firmas pendientes del operador anterior.
 - **La administración no se puede abandonar:** `renounceOwnership` está deshabilitado. Para cambiar de owner se usa `transferOwnership` y el nuevo owner confirma con `acceptOwnership`.
 - **Rescate de tokens:** `rescatarTokens(token, destino, monto)` recupera cualquier token enviado directamente al contrato por error.
 - **Sin reentrada ni doble pago:** `nonReentrant`, y la orden se marca como pagada antes de mover fondos.
+
+## Compatibilidad backend ↔ contrato
+
+`src/firmas.js` produce la firma y `hashOrden(orden)` del contrato expone el digest que se verifica. Ambos lados comparten un vector de referencia (clave de pruebas pública, `chainId` 42161, dirección fija):
+
+- `test/backend/firmas.test.js` comprueba que el backend produce exactamente ese digest y esa firma.
+- `test_VectorFirmaBackend` en `test/contracts/` comprueba que el contrato acepta esa firma y ejecuta el pago.
+
+Si cambias la estructura de la orden o el dominio, actualiza los dos tests a la vez.
 
 ## Desarrollo
 
@@ -38,7 +60,7 @@ forge build
 forge test -vvv
 ```
 
-El CI compila el contrato y ejecuta los tests en cada pull request (job `contrato`).
+El CI compila el contrato y ejecuta sus tests (job `contrato`), y ejecuta los tests del backend, incluido el de firmas (job `check`), en cada pull request.
 
 ## Despliegue
 
@@ -48,7 +70,7 @@ El script lee los parámetros de variables de entorno:
 |----------|-------|
 | `MXNB_ADDRESS` | Proxy de MXNB de la red (ver [direcciones](arquitectura.md#direcciones-de-tokens)). |
 | `TESORERIA_ADDRESS` | Wallet que recibe la comisión. |
-| `OPERADOR_ADDRESS` | Dirección de `OPERADOR_PRIVATE_KEY` del backend. |
+| `OPERADOR_ADDRESS` | Dirección de `OPERADOR_PRIVATE_KEY` del backend (solo firma; no necesita ETH). |
 | `OWNER_ADDRESS` | Multisig administrador. |
 | `COMISION_BPS` | Comisión en puntos básicos (p. ej. `500` = 5 %; máximo `3000`). |
 

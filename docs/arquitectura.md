@@ -7,7 +7,7 @@ Este documento describe cómo está organizado el orquestador de **589**.
 Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) en **Arbitrum**. Todo el dinero dentro del sistema circula como **MXNB**, la stablecoin de peso mexicano de 6 decimales.
 
 1. **Entrada:** el usuario deposita pesos por SPEI a una CLABE propia de **Juno**. Juno emite MXNB y el backend lo retira a la wallet del usuario.
-2. **Compra:** el backend crea una orden en el contrato `PagoAtomicoMXNB`. El comprador firma `approve` + `pagarOrden` en una sola UserOperation, y el contrato reparte el pago entre creador y plataforma en la misma transacción.
+2. **Compra:** el backend firma la orden fuera de la cadena (EIP-712), sin transacción ni gas. El comprador envía `approve` + `pagarOrden(orden, firma)` en una sola UserOperation; el contrato `PagoAtomicoMXNB` verifica la firma y reparte el pago entre creador y plataforma en la misma transacción.
 3. **Salida A (México):** el creador envía MXNB a Juno y el backend pide una redención SPEI a su cuenta bancaria.
 4. **Salida B (EE. UU.):** la tesorería convierte MXNB → USDC en Juno, envía el USDC a una *liquidation address* de **Bridge** y Bridge liquida en USD por ACH.
 
@@ -30,10 +30,13 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 │   └── PagoAtomicoMXNB.sol   # Contrato de pago atómico con reparto
 ├── lib/                      # Submódulos: OpenZeppelin y forge-std
 ├── script/                   # Script de despliegue (Foundry)
-├── test/contracts/           # Tests del contrato (Foundry)
+├── test/
+│   ├── backend/              # Tests del backend (node --test)
+│   └── contracts/            # Tests del contrato (Foundry)
 ├── foundry.toml              # Configuración de Foundry
 ├── db/
-│   └── schema.sql            # Esquema PostgreSQL (v2.1)
+│   ├── schema.sql            # Esquema PostgreSQL (v2.2)
+│   └── migraciones/          # Cambios para bases de datos existentes
 ├── docs/                     # Esta documentación
 └── src/
     ├── servidor.js           # Punto de entrada: Express, órdenes, arranque de trabajadores
@@ -43,6 +46,7 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
     ├── juno.js               # Cliente HMAC de Juno Mint Platform y retiros de Bitso
     ├── bridge.js             # Cliente de Bridge y verificación de webhooks
     ├── chain.js              # Acceso a Arbitrum con viem (contrato, MXNB, USDC)
+    ├── firmas.js             # Firma EIP-712 de órdenes
     ├── db.js                 # Consultas SQL y máquinas de estado
     └── unidades.js           # Conversión de montos a micro-unidades (BigInt)
 ```
@@ -51,12 +55,13 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 
 | Componente | Responsabilidad |
 |------------|-----------------|
-| `servidor.js` | Autentica con Privy, aplica rate limit (10 req/min por usuario), crea órdenes on-chain y devuelve las `calls` que firma el cliente. Reconcilia órdenes pendientes con el estado del contrato. |
+| `servidor.js` | Autentica con Privy, aplica rate limit (10 req/min por usuario), firma órdenes (EIP-712) y devuelve las `calls` que envía el cliente. Reconcilia órdenes pendientes con el estado del contrato. |
 | `onboarding.js` | Toma un bloqueo optimista en `usuarios_perfil`, crea la CLABE en Juno, registra la smart wallet y marca el perfil como `completo`. Es idempotente y se puede reintentar. |
 | `salidas.js` | Ruta A (`/api/retiros/mx`) para creadores y Ruta B (`/api/tesoreria/salidas-us`) protegida con `ADMIN_API_SECRET`. |
 | `webhooks.js` | Guarda cada evento de Juno en `juno_transacciones` y avanza los estados de depósitos, retiros, redenciones y conversiones. Verifica la firma de los eventos de Bridge y cierra lotes ACH. |
 | `juno.js` | Firma cada llamada con HMAC-SHA256 (`nonce + método + ruta + cuerpo`) y envía `X-Idempotency-Key` cuando corresponde. |
-| `chain.js` | Lecturas y escrituras en Arbitrum: `crearOrden`, saldos, transferencias de USDC de tesorería y escucha de `CompraConfirmada`. |
+| `chain.js` | Lecturas y escrituras en Arbitrum: comisión y estado de órdenes, saldos, transferencias de USDC de tesorería y escucha de `CompraConfirmada`. |
+| `firmas.js` | Tipos, dominio y firma EIP-712 de órdenes; debe coincidir con `ORDEN_TYPEHASH` del contrato. |
 | `db.js` | Reclama trabajo con `FOR UPDATE SKIP LOCKED` para que varios trabajadores no procesen la misma fila. |
 | `unidades.js` | Convierte montos de texto a BigInt de 6 decimales; nunca se usan flotantes con dinero. |
 
@@ -65,7 +70,7 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 | Método y ruta | Autenticación | Descripción |
 |---------------|---------------|-------------|
 | `POST /api/onboarding` | Privy | Da de alta al usuario y devuelve su CLABE y wallet. |
-| `POST /api/ordenes` | Privy | Crea una orden para `itemId` y devuelve `calls` (`approve` + `pagarOrden`). |
+| `POST /api/ordenes` | Privy | Crea y firma una orden para `itemId` y devuelve `expiraEn` y `calls` (`approve` + `pagarOrden(orden, firma)`). |
 | `GET /api/ordenes/:orderId` | Privy | Estado de una orden propia. |
 | `POST /api/retiros/mx` | Privy | Inicia un retiro a México; devuelve la dirección de Juno a la que enviar MXNB. |
 | `GET /api/retiros/mx/:id` | Privy | Estado de un retiro propio. |
@@ -102,9 +107,9 @@ Además, `vigilarCompras` escucha `CompraConfirmada` para marcar órdenes pagada
 
 ## Contrato `PagoAtomicoMXNB`
 
-- El **operador** (backend) crea órdenes con comprador, creador, monto y caducidad fijos. La comisión se congela al crear la orden y no puede superar el 30 %.
-- Solo el **comprador** de la orden puede pagarla, y solo antes de que caduque. La orden se marca como pagada antes de mover fondos, y `nonReentrant` evita la reentrada.
-- El **owner** (idealmente un multisig, con `Ownable2Step`) puede cambiar tesorería, operador y comisión, pausar el contrato y rescatar tokens enviados por error. No puede renunciar a la administración.
+- El **operador** (backend) firma cada orden fuera de la cadena con comprador, creador, monto, comisión y caducidad fijos. No envía transacciones.
+- Solo el **comprador** de la orden puede pagarla, una sola vez y antes de que caduque. El contrato verifica la firma, marca la orden como pagada antes de mover fondos, y `nonReentrant` evita la reentrada.
+- El **owner** (idealmente un multisig, con `Ownable2Step`) puede cambiar tesorería, operador y comisión (máximo 30 %), pausar el contrato y rescatar tokens enviados por error. No puede renunciar a la administración.
 
 Detalles, tests y despliegue en [Contrato](contrato.md).
 

@@ -68,9 +68,12 @@ app.post(
 
     const orderId = crypto.randomBytes(16).toString('hex');
     const expiraEn = BigInt(Math.floor(Date.now() / 1000)) + VIGENCIA_ORDEN_SEGUNDOS;
-    await db.guardarOrden({ orderId, userId: req.userId, itemId, monto: item.monto, comprador, creador });
+    await db.guardarOrden({ orderId, userId: req.userId, itemId, monto: item.monto, comprador, creador, expiraEn });
+
+    // Firma EIP-712 fuera de la cadena: no hay transacción del operador ni gas por orden.
+    let pago;
     try {
-      await chain.crearOrdenOnchain({ orderId, comprador, creador, monto: item.monto, expiraEn });
+      pago = await chain.firmarOrdenPago({ orderId, comprador, creador, monto: item.monto, expiraEn });
     } catch (error) {
       await db.marcarOrdenCancelada(orderId);
       throw error;
@@ -81,7 +84,7 @@ app.post(
       orderId,
       monto: deMicro(item.monto),
       expiraEn: new Date(Number(expiraEn) * 1000).toISOString(),
-      calls: chain.callsPago({ orderId, monto: item.monto }),
+      calls: chain.callsPago(pago),
     });
   })
 );
@@ -105,12 +108,16 @@ async function alPagarOrden({ orderId, txHash }) {
   }
 }
 
+// Margen sobre expiraEn antes de dar una orden por caducada, por si el reloj local va adelantado
+// respecto al de la cadena o queda un bloque en camino.
+const MARGEN_CADUCIDAD_MS = 60_000;
+
 async function reconciliarOrdenes() {
-  for (const orderId of await db.ordenesPendientesAntiguas(60)) {
+  for (const { orderId, expiraEn } of await db.ordenesPendientesAntiguas(60)) {
     const estado = await chain.estadoOrden(orderId);
     if (estado.pagada) await alPagarOrden({ orderId, txHash: null });
     // Una orden caducada ya no se puede pagar en el contrato, así que se da por cancelada.
-    else if (estado.cancelada || BigInt(Math.floor(Date.now() / 1000)) >= estado.expiraEn) {
+    else if (estado.cancelada || Date.now() > expiraEn.getTime() + MARGEN_CADUCIDAD_MS) {
       await db.marcarOrdenCancelada(orderId);
     }
   }

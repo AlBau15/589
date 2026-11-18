@@ -1,4 +1,4 @@
--- Esquema v2.1 (Arbitrum + Juno + Bridge Ruta B completa). Montos en unidades mínimas (6 decimales).
+-- Esquema v2.2 (Arbitrum + Juno + Bridge Ruta B completa + órdenes firmadas EIP-712). Montos en unidades mínimas (6 decimales).
 
 CREATE TABLE usuarios_perfil (
   user_id                   TEXT PRIMARY KEY,                -- userId de Privy
@@ -35,6 +35,7 @@ CREATE TABLE ordenes (
   estado         TEXT NOT NULL DEFAULT 'creada'
                  CHECK (estado IN ('creada', 'pagada', 'cancelada')),
   tx_hash        TEXT,
+  expira_en      TIMESTAMPTZ NOT NULL,                       -- caducidad firmada en la orden (EIP-712)
   creado_en      TIMESTAMPTZ NOT NULL DEFAULT now(),
   actualizado_en TIMESTAMPTZ NOT NULL DEFAULT now()
 );

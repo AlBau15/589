@@ -86,9 +86,9 @@ export async function obtenerItem(itemId) {
 
 export const guardarOrden = (o) =>
   q(
-    `INSERT INTO ordenes (order_id, user_id, item_id, monto, comprador, creador)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [o.orderId, o.userId, o.itemId, o.monto.toString(), o.comprador, o.creador]
+    `INSERT INTO ordenes (order_id, user_id, item_id, monto, comprador, creador, expira_en)
+     VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))`,
+    [o.orderId, o.userId, o.itemId, o.monto.toString(), o.comprador, o.creador, o.expiraEn.toString()]
   );
 
 export async function obtenerOrdenDeUsuario(orderId, userId) {
@@ -115,12 +115,12 @@ export const marcarOrdenCancelada = (orderId) =>
 
 export async function ordenesPendientesAntiguas(segundos = 60) {
   const { rows } = await q(
-    `SELECT order_id FROM ordenes
+    `SELECT order_id, expira_en FROM ordenes
      WHERE estado = 'creada' AND creado_en < now() - make_interval(secs => $1)
      ORDER BY creado_en LIMIT 100`,
     [segundos]
   );
-  return rows.map((r) => r.order_id);
+  return rows.map((r) => ({ orderId: r.order_id, expiraEn: r.expira_en }));
 }
 
 // ───────────── Eventos de Juno ─────────────

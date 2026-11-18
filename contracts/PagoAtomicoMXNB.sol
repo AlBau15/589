@@ -7,14 +7,17 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title Pago atómico en MXNB con reparto creador / plataforma (Arbitrum)
-/// @notice El operador (tu backend) crea órdenes con monto, comprador, creador y caducidad fijos.
-///         El comprador paga una sola vez y el contrato reparte en la misma transacción.
+/// @notice El operador (tu backend) firma cada orden fuera de la cadena (EIP-712) sin gastar gas.
+///         El comprador envía la orden firmada y paga en una sola transacción; el contrato
+///         verifica la firma y reparte el pago entre el creador y la tesorería.
 /// @dev MXNB es un token ERC-20 detrás de un proxy actualizable (6 decimales).
 ///      Apunta siempre al proxy, nunca a la implementación.
 ///      El contrato nunca retiene fondos: los pagos van directo al creador y a la tesorería.
-contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
+contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
     uint16 public constant BPS = 10_000;
@@ -22,32 +25,34 @@ contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Comisión máxima de la plataforma (30 %). Garantiza a los creadores al menos el 70 %.
     uint16 public constant COMISION_MAXIMA_BPS = 3_000;
 
+    bytes32 public constant ORDEN_TYPEHASH = keccak256(
+        "Orden(bytes16 orderId,address comprador,address creador,uint128 monto,uint16 comisionBps,uint64 expiraEn)"
+    );
+
+    /// @notice Orden de compra que firma el operador.
+    struct Orden {
+        bytes16 orderId;
+        address comprador; // única dirección que puede pagarla
+        address creador; // recibe monto − comisión
+        uint128 monto; // en unidades mínimas de MXNB (6 decimales)
+        uint16 comisionBps; // debe coincidir con la comisión vigente al pagar
+        uint64 expiraEn; // timestamp a partir del cual ya no se puede pagar
+    }
+
+    enum Estado {
+        Pendiente,
+        Pagada,
+        Cancelada
+    }
+
     IERC20 public immutable mxnb;
     address public tesoreria;
     address public operador;
     uint16 public comisionBps;
 
-    // Empaquetado en 3 slots: comprador | creador | monto + comisionBps + pagada + cancelada + expiraEn
-    struct Orden {
-        address comprador;
-        address creador;
-        uint128 monto;
-        uint16 comisionBps; // se congela al crear la orden
-        bool pagada;
-        bool cancelada;
-        uint64 expiraEn; // timestamp a partir del cual ya no se puede pagar
-    }
+    /// @notice Estado de cada orderId. Una orden firmada solo se puede pagar una vez.
+    mapping(bytes16 => Estado) public estados;
 
-    mapping(bytes16 => Orden) public ordenes;
-
-    event OrdenCreada(
-        bytes16 indexed orderId,
-        address indexed comprador,
-        address indexed creador,
-        uint128 monto,
-        uint16 comisionBps,
-        uint64 expiraEn
-    );
     event OrdenCancelada(bytes16 indexed orderId);
     event CompraConfirmada(
         bytes16 indexed orderId,
@@ -65,10 +70,9 @@ contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
     error NoAutorizado();
     error DireccionInvalida();
     error ComisionInvalida();
+    error ComisionCambiada();
     error MontoInvalido();
-    error CaducidadInvalida();
-    error OrdenExistente();
-    error OrdenInexistente();
+    error FirmaInvalida();
     error OrdenNoPagable();
     error OrdenExpirada();
     error CompradorInvalido();
@@ -81,6 +85,7 @@ contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
 
     constructor(IERC20 mxnb_, address tesoreria_, address operador_, uint16 comisionBps_, address owner_)
         Ownable(owner_)
+        EIP712("PagoAtomicoMXNB", "1")
     {
         if (address(mxnb_) == address(0) || tesoreria_ == address(0) || operador_ == address(0)) {
             revert DireccionInvalida();
@@ -92,62 +97,61 @@ contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
         comisionBps = comisionBps_;
     }
 
-    // ───────────── Operador ─────────────
-
-    /// @param expiraEn Timestamp (segundos) hasta el que se puede pagar la orden, exclusivo.
-    function crearOrden(bytes16 orderId, address comprador, address creador, uint128 monto, uint64 expiraEn)
-        external
-        soloOperador
-        whenNotPaused
-    {
-        if (comprador == address(0) || creador == address(0)) revert DireccionInvalida();
-        if (monto == 0) revert MontoInvalido();
-        if (expiraEn <= block.timestamp) revert CaducidadInvalida();
-        if (ordenes[orderId].comprador != address(0)) revert OrdenExistente();
-
-        ordenes[orderId] = Orden({
-            comprador: comprador,
-            creador: creador,
-            monto: monto,
-            comisionBps: comisionBps,
-            pagada: false,
-            cancelada: false,
-            expiraEn: expiraEn
-        });
-        emit OrdenCreada(orderId, comprador, creador, monto, comisionBps, expiraEn);
-    }
-
-    function cancelarOrden(bytes16 orderId) external soloOperador {
-        Orden storage o = ordenes[orderId];
-        if (o.comprador == address(0)) revert OrdenInexistente();
-        if (o.pagada || o.cancelada) revert OrdenNoPagable();
-        o.cancelada = true;
-        emit OrdenCancelada(orderId);
-    }
-
     // ───────────── Comprador ─────────────
 
-    /// @notice Paga una orden. Requiere `approve` previo del monto exacto a este contrato.
+    /// @notice Paga una orden firmada por el operador. Requiere `approve` previo de `orden.monto` a este contrato.
     ///         Con smart wallets (ERC-4337) se envían approve + pagarOrden en un solo UserOperation.
-    function pagarOrden(bytes16 orderId) external nonReentrant whenNotPaused {
-        Orden storage o = ordenes[orderId];
-        if (o.comprador == address(0)) revert OrdenInexistente();
-        if (o.pagada || o.cancelada) revert OrdenNoPagable();
-        if (block.timestamp >= o.expiraEn) revert OrdenExpirada();
-        if (msg.sender != o.comprador) revert CompradorInvalido();
+    function pagarOrden(Orden calldata orden, bytes calldata firma) external nonReentrant whenNotPaused {
+        if (msg.sender != orden.comprador) revert CompradorInvalido();
+        if (block.timestamp >= orden.expiraEn) revert OrdenExpirada();
+        if (estados[orden.orderId] != Estado.Pendiente) revert OrdenNoPagable();
+        if (orden.monto == 0) revert MontoInvalido();
+        if (orden.creador == address(0)) revert DireccionInvalida();
+        if (orden.comisionBps != comisionBps) revert ComisionCambiada();
+        _verificarFirma(orden, firma);
 
         // Se marca antes de mover fondos (anti-repetición)
-        o.pagada = true;
+        estados[orden.orderId] = Estado.Pagada;
 
-        uint256 monto = o.monto;
-        uint256 montoPlataforma = (monto * o.comisionBps) / BPS;
+        uint256 monto = orden.monto;
+        uint256 montoPlataforma = (monto * orden.comisionBps) / BPS;
         uint256 montoCreador = monto - montoPlataforma;
-        address creador = o.creador;
 
-        if (montoCreador > 0) mxnb.safeTransferFrom(msg.sender, creador, montoCreador);
+        if (montoCreador > 0) mxnb.safeTransferFrom(msg.sender, orden.creador, montoCreador);
         if (montoPlataforma > 0) mxnb.safeTransferFrom(msg.sender, tesoreria, montoPlataforma);
 
-        emit CompraConfirmada(orderId, msg.sender, creador, monto, montoCreador, montoPlataforma);
+        emit CompraConfirmada(orden.orderId, msg.sender, orden.creador, monto, montoCreador, montoPlataforma);
+    }
+
+    /// @notice Digest EIP-712 que firma el operador. Útil para depurar firmas desde el backend.
+    function hashOrden(Orden calldata orden) public view returns (bytes32) {
+        return _hashTypedDataV4(
+            keccak256(
+                abi.encode(
+                    ORDEN_TYPEHASH,
+                    orden.orderId,
+                    orden.comprador,
+                    orden.creador,
+                    orden.monto,
+                    orden.comisionBps,
+                    orden.expiraEn
+                )
+            )
+        );
+    }
+
+    function _verificarFirma(Orden calldata orden, bytes calldata firma) private view {
+        (address firmante, ECDSA.RecoverError error_,) = ECDSA.tryRecover(hashOrden(orden), firma);
+        if (error_ != ECDSA.RecoverError.NoError || firmante != operador) revert FirmaInvalida();
+    }
+
+    // ───────────── Operador ─────────────
+
+    /// @notice Invalida una orden firmada antes de que se pague. Las órdenes también caducan solas en `expiraEn`.
+    function cancelarOrden(bytes16 orderId) external soloOperador {
+        if (estados[orderId] != Estado.Pendiente) revert OrdenNoPagable();
+        estados[orderId] = Estado.Cancelada;
+        emit OrdenCancelada(orderId);
     }
 
     // ───────────── Administración (owner, idealmente un multisig) ─────────────
@@ -158,13 +162,14 @@ contract PagoAtomicoMXNB is Ownable2Step, Pausable, ReentrancyGuard {
         emit TesoreriaActualizada(nueva);
     }
 
+    /// @dev Cambiar el operador invalida todas las órdenes firmadas por el anterior que sigan sin pagar.
     function setOperador(address nuevo) external onlyOwner {
         if (nuevo == address(0)) revert DireccionInvalida();
         operador = nuevo;
         emit OperadorActualizado(nuevo);
     }
 
-    /// @dev Solo afecta a órdenes nuevas; las existentes conservan su comisión.
+    /// @dev Las órdenes firmadas con la comisión anterior dejan de poder pagarse (ComisionCambiada).
     function setComisionBps(uint16 nueva) external onlyOwner {
         if (nueva > COMISION_MAXIMA_BPS) revert ComisionInvalida();
         comisionBps = nueva;

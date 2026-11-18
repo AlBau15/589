@@ -9,6 +9,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { arbitrum, arbitrumSepolia } from 'viem/chains';
+import { firmarOrden } from './firmas.js';
 
 const testnet = process.env.ARBITRUM_TESTNET === '1';
 const red = testnet ? arbitrumSepolia : arbitrum;
@@ -31,15 +32,18 @@ export const CONTRATO = norm(process.env.CONTRATO_PAGOS);
 const transporte = http(process.env.ARBITRUM_RPC_URL);
 export const publicClient = createPublicClient({ chain: red, transport: transporte });
 
+// El operador solo firma órdenes fuera de la cadena (EIP-712): no envía transacciones ni necesita ETH.
 const operador = privateKeyToAccount(process.env.OPERADOR_PRIVATE_KEY);
-const walletClient = createWalletClient({ account: operador, chain: red, transport: transporte });
 
 const abiPagos = parseAbi([
-  'function crearOrden(bytes16 orderId, address comprador, address creador, uint128 monto, uint64 expiraEn)',
-  'function pagarOrden(bytes16 orderId)',
-  'function ordenes(bytes16 orderId) view returns (address comprador, address creador, uint128 monto, uint16 comisionBps, bool pagada, bool cancelada, uint64 expiraEn)',
+  'struct Orden { bytes16 orderId; address comprador; address creador; uint128 monto; uint16 comisionBps; uint64 expiraEn; }',
+  'function pagarOrden(Orden orden, bytes firma)',
+  'function estados(bytes16 orderId) view returns (uint8)',
+  'function comisionBps() view returns (uint16)',
   'event CompraConfirmada(bytes16 indexed orderId, address indexed comprador, address indexed creador, uint256 montoTotal, uint256 montoCreador, uint256 montoPlataforma)',
 ]);
+
+const ESTADO = { PENDIENTE: 0, PAGADA: 1, CANCELADA: 2 };
 
 const abiErc20 = parseAbi([
   'function balanceOf(address owner) view returns (uint256)',
@@ -49,16 +53,12 @@ const abiErc20 = parseAbi([
 
 const aBytes16 = (orderIdHex32) => `0x${orderIdHex32}`;
 
-export async function crearOrdenOnchain({ orderId, comprador, creador, monto, expiraEn }) {
-  const hash = await walletClient.writeContract({
-    address: CONTRATO,
-    abi: abiPagos,
-    functionName: 'crearOrden',
-    args: [aBytes16(orderId), comprador, creador, monto, expiraEn],
-  });
-  const recibo = await publicClient.waitForTransactionReceipt({ hash });
-  if (recibo.status !== 'success') throw new Error('crearOrden revertida');
-  return hash;
+// Firma la orden con la comisión vigente del contrato. No envía ninguna transacción.
+export async function firmarOrdenPago({ orderId, comprador, creador, monto, expiraEn }) {
+  const comisionBps = await publicClient.readContract({ address: CONTRATO, abi: abiPagos, functionName: 'comisionBps' });
+  const orden = { orderId: aBytes16(orderId), comprador, creador, monto, comisionBps, expiraEn };
+  const firma = await firmarOrden(operador, { chainId: red.id, contrato: CONTRATO, orden });
+  return { orden, firma };
 }
 
 export const saldoMxnb = (direccion) =>
@@ -92,24 +92,25 @@ export async function transferirUsdcTesoreria({ destino, montoMicro }) {
 }
 
 export async function estadoOrden(orderId) {
-  const [comprador, creador, monto, comisionBps, pagada, cancelada, expiraEn] = await publicClient.readContract({
+  const estado = await publicClient.readContract({
     address: CONTRATO,
     abi: abiPagos,
-    functionName: 'ordenes',
+    functionName: 'estados',
     args: [aBytes16(orderId)],
   });
-  return { comprador, creador, monto, comisionBps, pagada, cancelada, expiraEn };
+  return { pagada: estado === ESTADO.PAGADA, cancelada: estado === ESTADO.CANCELADA };
 }
 
-export function callsPago({ orderId, monto }) {
+// Llamadas que el cliente envía en un solo UserOperation: approve del monto exacto + pago de la orden firmada
+export function callsPago({ orden, firma }) {
   return [
     {
       to: MXNB,
-      data: encodeFunctionData({ abi: abiErc20, functionName: 'approve', args: [CONTRATO, monto] }),
+      data: encodeFunctionData({ abi: abiErc20, functionName: 'approve', args: [CONTRATO, orden.monto] }),
     },
     {
       to: CONTRATO,
-      data: encodeFunctionData({ abi: abiPagos, functionName: 'pagarOrden', args: [aBytes16(orderId)] }),
+      data: encodeFunctionData({ abi: abiPagos, functionName: 'pagarOrden', args: [orden, firma] }),
     },
   ];
 }

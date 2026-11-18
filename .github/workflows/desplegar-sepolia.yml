@@ -78,8 +78,44 @@ jobs:
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
         run: |
           set -euo pipefail
+          # Quita espacios, saltos de línea y comillas que se cuelan al pegar los secrets
+          limpiar() { local v="${1//[[:space:]]/}"; v="${v#[\"\']}"; v="${v%[\"\']}"; printf '%s' "$v"; }
+          DEPLOYER_PRIVATE_KEY=$(limpiar "$DEPLOYER_PRIVATE_KEY")
+          ARBITRUM_SEPOLIA_RPC_URL=$(limpiar "$ARBITRUM_SEPOLIA_RPC_URL")
+          ETHERSCAN_API_KEY=$(limpiar "$ETHERSCAN_API_KEY")
+
           if [[ -z "$DEPLOYER_PRIVATE_KEY" || -z "$ARBITRUM_SEPOLIA_RPC_URL" ]]; then
             echo "::error::Faltan los secrets DEPLOYER_PRIVATE_KEY o ARBITRUM_SEPOLIA_RPC_URL en el environment arbitrum-sepolia"
+            exit 1
+          fi
+          # Sin esquema, Foundry interpreta el valor como la ruta de un archivo (IPC) y falla con
+          # "No such file or directory".
+          if [[ ! "$ARBITRUM_SEPOLIA_RPC_URL" =~ ^(https?|wss?):// ]]; then
+            echo "::error::ARBITRUM_SEPOLIA_RPC_URL debe empezar por https:// (p. ej. https://arb-sepolia.g.alchemy.com/v2/<tu-clave>)"
+            exit 1
+          fi
+          if [[ "$DEPLOYER_PRIVATE_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            DEPLOYER_PRIVATE_KEY="0x$DEPLOYER_PRIVATE_KEY"
+          fi
+          if [[ ! "$DEPLOYER_PRIVATE_KEY" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::DEPLOYER_PRIVATE_KEY debe ser una clave privada de 64 caracteres hexadecimales (con o sin 0x)"
+            exit 1
+          fi
+
+          # Comprueba que la RPC responde y es Arbitrum Sepolia antes de desplegar
+          chain_id=$(cast chain-id --rpc-url "$ARBITRUM_SEPOLIA_RPC_URL") || {
+            echo "::error::La RPC no responde. Revisa la URL y la clave del proveedor en ARBITRUM_SEPOLIA_RPC_URL"
+            exit 1
+          }
+          if [[ "$chain_id" != "421614" ]]; then
+            echo "::error::La RPC es de la red $chain_id, no de Arbitrum Sepolia (421614)"
+            exit 1
+          fi
+          desplegador=$(cast wallet address --private-key "$DEPLOYER_PRIVATE_KEY")
+          saldo=$(cast balance "$desplegador" --rpc-url "$ARBITRUM_SEPOLIA_RPC_URL")
+          echo "Desplegador: $desplegador · saldo: $(cast from-wei "$saldo") ETH"
+          if [[ "$saldo" == "0" ]]; then
+            echo "::error::La wallet $desplegador no tiene ETH en Arbitrum Sepolia. Cárgala desde un faucet"
             exit 1
           fi
           verificar=()

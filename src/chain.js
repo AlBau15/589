@@ -35,9 +35,9 @@ const operador = privateKeyToAccount(process.env.OPERADOR_PRIVATE_KEY);
 const walletClient = createWalletClient({ account: operador, chain: red, transport: transporte });
 
 const abiPagos = parseAbi([
-  'function crearOrden(bytes16 orderId, address comprador, address creador, uint128 monto)',
+  'function crearOrden(bytes16 orderId, address comprador, address creador, uint128 monto, uint64 expiraEn)',
   'function pagarOrden(bytes16 orderId)',
-  'function ordenes(bytes16 orderId) view returns (address comprador, address creador, uint128 monto, uint16 comisionBps, bool pagada, bool cancelada)',
+  'function ordenes(bytes16 orderId) view returns (address comprador, address creador, uint128 monto, uint16 comisionBps, bool pagada, bool cancelada, uint64 expiraEn)',
   'event CompraConfirmada(bytes16 indexed orderId, address indexed comprador, address indexed creador, uint256 montoTotal, uint256 montoCreador, uint256 montoPlataforma)',
 ]);
 
@@ -49,12 +49,12 @@ const abiErc20 = parseAbi([
 
 const aBytes16 = (orderIdHex32) => `0x${orderIdHex32}`;
 
-export async function crearOrdenOnchain({ orderId, comprador, creador, monto }) {
+export async function crearOrdenOnchain({ orderId, comprador, creador, monto, expiraEn }) {
   const hash = await walletClient.writeContract({
     address: CONTRATO,
     abi: abiPagos,
     functionName: 'crearOrden',
-    args: [aBytes16(orderId), comprador, creador, monto],
+    args: [aBytes16(orderId), comprador, creador, monto, expiraEn],
   });
   const recibo = await publicClient.waitForTransactionReceipt({ hash });
   if (recibo.status !== 'success') throw new Error('crearOrden revertida');
@@ -92,13 +92,13 @@ export async function transferirUsdcTesoreria({ destino, montoMicro }) {
 }
 
 export async function estadoOrden(orderId) {
-  const [comprador, creador, monto, comisionBps, pagada, cancelada] = await publicClient.readContract({
+  const [comprador, creador, monto, comisionBps, pagada, cancelada, expiraEn] = await publicClient.readContract({
     address: CONTRATO,
     abi: abiPagos,
     functionName: 'ordenes',
     args: [aBytes16(orderId)],
   });
-  return { comprador, creador, monto, comisionBps, pagada, cancelada };
+  return { comprador, creador, monto, comisionBps, pagada, cancelada, expiraEn };
 }
 
 export function callsPago({ orderId, monto }) {

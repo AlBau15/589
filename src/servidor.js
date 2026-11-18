@@ -6,7 +6,13 @@ import { getAddress } from 'viem';
 import * as chain from './chain.js';
 import * as db from './db.js';
 import { rutasOnboarding } from './onboarding.js';
-import { procesarDepositos, procesarRetirosMx, procesarSalidasUs, rutasSalidas } from './salidas.js';
+import {
+  procesarDepositos,
+  procesarRetirosMx,
+  procesarSalidasUs,
+  rutasSalidas,
+  sincronizarRetirosBitso,
+} from './salidas.js';
 import { deMicro, seguro } from './unidades.js';
 import { webhooks } from './webhooks.js';
 
@@ -126,5 +132,6 @@ app.listen(process.env.PORT ?? 3000, () => {
   ciclo('depositos', procesarDepositos, 10_000);
   ciclo('retiros-mx', procesarRetirosMx, 10_000);
   ciclo('salidas-us', procesarSalidasUs, 15_000);
+  ciclo('retiros-bitso', sincronizarRetirosBitso, 30_000);
   ciclo('reconciliar-ordenes', reconciliarOrdenes, 30_000);
 });

@@ -127,3 +127,11 @@ export async function retirarUsdcExterno({ address, montoUsdc, chain = 'ARB', or
   const r = await llamar('POST', '/v3/withdrawals', payload, { baseUrl: bitsoBase });
   return extraerId(r);
 }
+
+// Consulta un retiro de USDC creado con retirarUsdcExterno para obtener su estado y tx hash en cadena
+export async function obtenerRetiroUsdcExterno(wid) {
+  const bitsoBase = process.env.BITSO_API_URL ?? process.env.JUNO_BASE_URL;
+  const r = await llamar('GET', `/v3/withdrawals/${encodeURIComponent(wid)}`, undefined, { baseUrl: bitsoBase });
+  const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
+  return { estado: p?.status ?? null, txHash: p?.details?.tx_hash ?? p?.tx_hash ?? null };
+}

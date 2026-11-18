@@ -223,14 +223,14 @@ export async function enviarUsdcABridge(salida) {
   if (modo === 'onchain_tesoreria') {
     const txHash = await chain.transferirUsdcTesoreria({
       destino: cuentaBridge.liquidationAddress,
-      montoMicro: salida.monto_usdc,
+      montoMicro: salida.montoUsdc,
     });
     return { txHashBridge: txHash, bitsoWithdrawalId: null };
   }
 
   const bitsoWithdrawalId = await juno.retirarUsdcExterno({
     address: cuentaBridge.liquidationAddress,
-    montoUsdc: deMicro(salida.monto_usdc),
+    montoUsdc: deMicro(salida.montoUsdc),
     chain: 'ARB',
     originId: salida.id,
   });
@@ -252,6 +252,27 @@ export async function procesarSalidasUs() {
     } catch (error) {
       console.error('envío USDC a Bridge falló:', salida.id, error.cuerpo ?? error);
       await db.liberarSalidaUs(salida.id, { error: error.message, cuerpo: error.cuerpo ?? null });
+    }
+  }
+}
+
+// Modo 'bitso_api': Bitso no devuelve el tx hash al crear el retiro. Se consulta después y se guarda
+// en tx_hash_bridge para que el webhook de Bridge pueda cerrar el lote como 'completado_ach'.
+export async function sincronizarRetirosBitso() {
+  for (const salida of await db.salidasUsSinTxHash(25)) {
+    try {
+      const retiro = await juno.obtenerRetiroUsdcExterno(salida.bitsoWithdrawalId);
+      if (retiro.txHash) {
+        await db.guardarTxHashSalidaUs(salida.id, retiro.txHash);
+      } else if (['failed', 'cancelled'].includes(String(retiro.estado).toLowerCase())) {
+        // No se reintenta automáticamente para no arriesgar un doble envío; requiere revisión manual.
+        await db.actualizarSalidaUs(salida.id, {
+          estado: 'fallido',
+          detalle: { error: `Retiro de Bitso ${retiro.estado}`, bitsoWithdrawalId: salida.bitsoWithdrawalId },
+        });
+      }
+    } catch (error) {
+      console.error('consulta de retiro Bitso falló:', salida.id, error.cuerpo ?? error);
     }
   }
 }

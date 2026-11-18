@@ -314,7 +314,13 @@ export async function actualizarSalidaUs(id, campos) {
   if (!claves.length) return;
   const sets = claves.map((k, i) => `${k} = $${i + 2}`).join(', ');
   const valores = claves.map((k) =>
-    k === 'detalle' ? JSON.stringify(campos[k]) : k === 'monto_usdc' ? campos[k].toString() : campos[k]
+    k === 'detalle'
+      ? JSON.stringify(campos[k])
+      : k === 'monto_usdc'
+        ? campos[k] == null
+          ? null
+          : campos[k].toString()
+        : campos[k]
   );
   await q(`UPDATE salidas_us SET ${sets}, actualizado_en = now() WHERE id = $1`, [id, ...valores]);
 }
@@ -407,4 +413,35 @@ export async function completarSalidaUsPorBridge(txHash) {
     [txHash]
   );
   return rowCount === 1;
+}
+
+// Lotes enviados vía Bitso cuyo tx hash en Arbitrum aún no se conoce
+export async function salidasUsSinTxHash(limite = 25) {
+  const { rows } = await q(
+    `SELECT id, bitso_withdrawal_id FROM salidas_us
+      WHERE estado = 'enviado_bridge' AND tx_hash_bridge IS NULL AND bitso_withdrawal_id IS NOT NULL
+      ORDER BY creado_en LIMIT $1`,
+    [limite]
+  );
+  return rows.map((r) => ({ id: r.id, bitsoWithdrawalId: r.bitso_withdrawal_id }));
+}
+
+// Guarda el tx hash y, si Bridge ya notificó la liquidación antes de conocerlo, cierra el lote
+export async function guardarTxHashSalidaUs(id, txHash) {
+  await q(
+    `UPDATE salidas_us SET tx_hash_bridge = $2, actualizado_en = now()
+      WHERE id = $1 AND tx_hash_bridge IS NULL`,
+    [id, txHash]
+  );
+  const { rowCount } = await q(
+    `SELECT 1 FROM bridge_eventos
+      WHERE LOWER(COALESCE(payload #>> '{data,source_deposit_instructions,tx_hash}',
+                           payload #>> '{event_object,deposit_tx_hash}',
+                           payload #>> '{data,deposit_tx_hash}')) = LOWER($1)
+        AND LOWER(COALESCE(payload #>> '{data,state}', payload #>> '{event_object,state}'))
+            IN ('payment_processed', 'completed')
+      LIMIT 1`,
+    [txHash]
+  );
+  if (rowCount) await completarSalidaUsPorBridge(txHash);
 }

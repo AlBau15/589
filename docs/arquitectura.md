@@ -91,6 +91,7 @@ Se arrancan en `servidor.js` salvo que `EJECUTAR_TRABAJADORES=0`:
 | `depositos` | 10 s | Envía el MXNB emitido por SPEI a la wallet del usuario. |
 | `retiros-mx` | 10 s | Pide a Juno la redención SPEI de los retiros `en_juno`. |
 | `salidas-us` | 15 s | Envía el USDC convertido a la liquidation address de Bridge. |
+| `retiros-bitso` | 30 s | En modo `bitso_api`, consulta en Bitso el tx hash de cada envío y lo guarda para que el webhook de Bridge pueda cerrar el lote. Si Bitso reporta el retiro como fallido, marca el lote `fallido` para revisión manual. |
 | `reconciliar-ordenes` | 30 s | Consulta en cadena las órdenes `creada` de hace más de 60 s. |
 
 Además, `vigilarCompras` escucha `CompraConfirmada` para marcar órdenes pagadas al instante.

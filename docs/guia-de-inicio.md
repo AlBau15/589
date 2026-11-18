@@ -4,7 +4,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 
 ## Requisitos
 
-- Node.js 20 o superior (se usan `fetch` y `AbortSignal.timeout` nativos).
+- Node.js 20.6 o superior (se usan `fetch`, `AbortSignal.timeout` y `--env-file` nativos).
 - PostgreSQL 13 o superior (`gen_random_uuid()` sin extensiones).
 - Cuentas y credenciales de:
   - **Privy** (autenticación y smart wallets con paymaster).
@@ -22,15 +22,11 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
    cd 589
    ```
 
-2. Instala las dependencias del backend:
+2. Instala las dependencias del backend (definidas en `package.json`):
 
    ```bash
-   npm init -y
-   npm pkg set type=module
-   npm i express express-rate-limit pg uuid viem @privy-io/server-auth
+   npm install
    ```
-
-   > El código usa módulos ES (`import`), por eso `package.json` necesita `"type": "module"`.
 
 3. Crea la base de datos y aplica el esquema:
 
@@ -89,8 +85,11 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 ## Uso
 
 ```bash
-node src/servidor.js
+npm start        # arranca src/servidor.js cargando la configuración de .env
+npm run check    # comprueba la sintaxis de todos los archivos de src/
 ```
+
+Para arrancar solo la API, sin trabajadores en segundo plano, pon `EJECUTAR_TRABAJADORES=0` en `.env`.
 
 Al arrancar, el servidor expone la API, escucha el evento `CompraConfirmada` del contrato y lanza los trabajadores periódicos (ver [arquitectura](arquitectura.md#trabajadores-en-segundo-plano)).
 

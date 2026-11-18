@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { PrivyClient } from '@privy-io/server-auth';
 import { getAddress } from 'viem';
 import * as chain from './chain.js';
@@ -36,7 +36,7 @@ async function autenticar(req, res, next) {
   }
 }
 
-const limitador = rateLimit({ windowMs: 60_000, limit: 10, keyGenerator: (req) => req.userId ?? req.ip });
+const limitador = rateLimit({ windowMs: 60_000, limit: 10, keyGenerator: (req) => req.userId ?? ipKeyGenerator(req.ip ?? '') });
 const comunes = { autenticar, limitador };
 
 app.use(rutasOnboarding({ privy, ...comunes }));

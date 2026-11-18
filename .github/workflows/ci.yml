@@ -27,6 +27,9 @@ jobs:
       - name: Comprobar sintaxis
         run: npm run check
 
+      - name: Tests
+        run: npm test
+
   contrato:
     name: contrato
     runs-on: ubuntu-latest

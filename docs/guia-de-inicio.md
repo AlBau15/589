@@ -35,6 +35,8 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
    psql pagos -f db/schema.sql
    ```
 
+   Si ya tenías una base de datos con un esquema anterior, aplica en orden los archivos de `db/migraciones/` en lugar de `schema.sql`.
+
 4. Despliega `contracts/PagoAtomicoMXNB.sol` con Foundry siguiendo la guía del [contrato](contrato.md#despliegue).
 
 5. Copia la configuración y rellénala:
@@ -56,7 +58,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 | `ARBITRUM_RPC_URL` | RPC de Arbitrum. |
 | `ARBITRUM_TESTNET` | `1` para Arbitrum Sepolia. |
 | `CONTRATO_PAGOS` | Dirección del contrato `PagoAtomicoMXNB` desplegado. |
-| `OPERADOR_PRIVATE_KEY` | Clave del operador que llama a `crearOrden`. |
+| `OPERADOR_PRIVATE_KEY` | Clave del operador que firma las órdenes (EIP-712). Solo firma: no envía transacciones ni necesita ETH. |
 | `ORDEN_VIGENCIA_SEGUNDOS` | Tiempo para pagar una orden antes de que caduque en el contrato (por defecto `900`). |
 | `MXNB_ADDRESS`, `USDC_ADDRESS` | Opcionales: sobrescriben las direcciones de los tokens. |
 | `JUNO_BASE_URL`, `JUNO_ENTORNO` | Host de Juno y entorno (`stage` / `production`) para la lista de IPs de webhooks. |
@@ -80,6 +82,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 ```bash
 npm start        # arranca src/servidor.js cargando la configuración de .env
 npm run check    # comprueba la sintaxis de todos los archivos de src/
+npm test         # tests del backend
 ```
 
 Para arrancar solo la API, sin trabajadores en segundo plano, pon `EJECUTAR_TRABAJADORES=0` en `.env`.

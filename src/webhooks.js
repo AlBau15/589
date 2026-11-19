@@ -1,8 +1,10 @@
 import express, { Router } from 'express';
 import { v1 as uuidv1 } from 'uuid';
 import * as db from './db.js';
+import * as juno from './juno.js';
 import { aMicro } from './unidades.js';
 import { verificarWebhookBridge } from './bridge.js';
+import { confirmarTransaccion, requerido, VerificacionError } from './verificacion.js';
 
 export const webhooks = Router();
 
@@ -14,81 +16,71 @@ const IPS_JUNO = {
 const permitidas = new Set(IPS_JUNO[process.env.JUNO_ENTORNO ?? 'production']);
 const ipOrigen = (req) => (req.ip ?? '').replace(/^::ffff:/, '');
 
-async function manejarEmision(payload) {
-  const emision = payload.issuance;
-  if (emision?.method !== 'SPEI' || !emision.deposit_receiver_clabe) {
-    console.warn('Emisión sin CLABE de SPEI, se ignora:', payload.id);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Todas las funciones reciben la transacción CONFIRMADA con la API de Juno (src/verificacion.js).
+
+async function manejarEmision(tx) {
+  if (tx.metodo && String(tx.metodo).toUpperCase() !== 'SPEI') {
+    console.warn('Emisión que no es por SPEI, se ignora:', tx.id, tx.metodo);
     return;
   }
-  let monto;
-  try {
-    monto = aMicro(emision.amount);
-  } catch {
-    console.error('Monto de emisión inválido, revisar a mano:', payload.id, emision.amount);
-    return;
-  }
-  const perfil = await db.obtenerPerfilPorClabe(emision.deposit_receiver_clabe);
+  const clabe = String(requerido(tx, 'clabe'));
+  const monto = aMicro(requerido(tx, 'monto'));
+  if (monto <= 0n) return console.warn('Emisión con monto 0, se ignora:', tx.id);
+  const perfil = await db.obtenerPerfilPorClabe(clabe);
   const nuevo = await db.registrarDeposito({
-    junoTxId: payload.id,
+    junoTxId: tx.id,
     userId: perfil?.userId ?? null,
-    clabe: emision.deposit_receiver_clabe,
+    clabe,
     monto,
     idemKey: uuidv1(),
   });
-  if (nuevo && !perfil) console.warn('Depósito sin usuario para la CLABE:', emision.deposit_receiver_clabe);
+  if (nuevo && !perfil) console.warn('Depósito sin usuario para la CLABE:', clabe);
 }
 
-async function manejarDepositoCripto(payload) {
-  const dep = payload.crypto_deposit;
-  if (!dep || String(dep.asset).toUpperCase() !== 'MXNB') return;
-  let monto;
-  try {
-    monto = aMicro(dep.amount);
-  } catch {
-    console.error('Monto de depósito cripto inválido:', payload.id, dep.amount);
-    return;
-  }
-  const r = await db.asignarDepositoCripto({
-    walletOrigen: String(dep.crypto_source_address ?? '').toLowerCase(),
-    monto,
-    junoDepositoId: payload.id,
-  });
-  if (r === null) {
-    console.warn('Depósito cripto sin retiro asociado, revisar a mano:', payload.id, dep.crypto_source_address);
+async function manejarDepositoCripto(tx) {
+  if (String(requerido(tx, 'activo')).toUpperCase() !== 'MXNB') return;
+  const monto = aMicro(requerido(tx, 'monto'));
+  if (monto <= 0n) return console.warn('Depósito cripto con monto 0, se ignora:', tx.id);
+  const walletOrigen = String(requerido(tx, 'origenCripto')).toLowerCase();
+  const r = await db.asignarDepositoCripto({ walletOrigen, monto, junoDepositoId: tx.id });
+  if (r === 'reactivado') {
+    console.warn('Depósito cripto tras expirar el retiro: se reactivó y se procesará:', tx.id, walletOrigen);
+  } else if (r === null) {
+    console.error('Depósito cripto sin retiro asociado, REVISAR A MANO (los fondos están en Juno):', tx.id, walletOrigen);
   }
 }
 
-async function manejarConversion(payload, ok) {
+async function manejarConversion(tx, ok) {
   let montoUsdc = null;
-  const conv = payload.conversion ?? payload;
-  const targetAmount = conv?.target_amount ?? conv?.credited_amount;
-  if (ok && targetAmount) {
+  if (ok && tx.montoDestino) {
     try {
-      montoUsdc = aMicro(targetAmount);
+      montoUsdc = aMicro(tx.montoDestino);
     } catch {
-      console.warn('No se pudo parsear target_amount de conversión:', payload.id, targetAmount);
+      console.warn('No se pudo leer el monto convertido, se usa el de la cotización:', tx.id, tx.montoDestino);
     }
   }
-  await db.resolverConversion(payload.id, ok, montoUsdc);
+  await db.resolverConversion(tx.id, ok, montoUsdc);
 }
 
-async function procesarEventoJuno(payload) {
-  const ok = payload.status === 'COMPLETE';
-  switch (payload.type) {
+async function procesarEventoJuno(tx) {
+  const ok = tx.estado === 'COMPLETE';
+  switch (tx.tipo) {
     case 'ISSUANCE':
-      if (ok) await manejarEmision(payload);
+      if (ok) await manejarEmision(tx);
       break;
     case 'CRYPTO_DEPOSIT':
-      if (ok) await manejarDepositoCripto(payload);
+      if (ok) await manejarDepositoCripto(tx);
       break;
     case 'CRYPTO_WITHDRAWAL':
-      await db.resolverRetiroDeposito(payload.id, ok);
+      await db.resolverRetiroDeposito(tx.id, ok);
       break;
     case 'REDEMPTION':
-      await db.resolverRedencion(payload.id, ok);
+      await db.resolverRedencion(tx.id, ok);
       break;
     case 'CONVERSION':
-      await manejarConversion(payload, ok);
+      await manejarConversion(tx, ok);
       break;
     default:
       break;
@@ -99,26 +91,40 @@ webhooks.post('/webhooks/juno', express.json({ limit: '100kb' }), async (req, re
   if (!permitidas.has(ipOrigen(req))) return res.status(403).send('IP no permitida');
 
   const { event, payload } = req.body ?? {};
-  if (event !== 'TRANSACTION' || !payload?.id || !payload?.type || !payload?.status) {
+  if (event !== 'TRANSACTION' || typeof payload?.id !== 'string' || !UUID.test(payload.id)) {
     return res.status(400).send('Payload inválido');
   }
 
   try {
+    // El webhook solo dice "revisa la transacción X": los datos se piden a Juno.
+    let respuesta;
+    try {
+      respuesta = await juno.obtenerTransaccion(payload.id);
+    } catch (error) {
+      if (error instanceof juno.JunoError && error.status === 404) {
+        console.warn('Webhook de Juno con una transacción que Juno no conoce, se ignora:', payload.id);
+        return res.status(404).send('Transacción desconocida');
+      }
+      throw error;
+    }
+    const tx = confirmarTransaccion(payload.id, respuesta);
+
     const ahora = new Date().toISOString();
     await db.registrarEventoJuno({
-      id: payload.id,
-      tipo: payload.type,
-      estado: payload.status,
-      payload,
-      creadoEn: payload.created_at ?? ahora,
-      actualizadoEn: payload.updated_at ?? ahora,
+      id: tx.id,
+      tipo: tx.tipo,
+      estado: tx.estado,
+      payload: respuesta,
+      creadoEn: respuesta.created_at ?? ahora,
+      actualizadoEn: respuesta.updated_at ?? ahora,
     });
-    if (payload.status === 'COMPLETE' || payload.status === 'FAILED') {
-      await procesarEventoJuno(payload);
+    if (tx.estado === 'COMPLETE' || tx.estado === 'FAILED') {
+      await procesarEventoJuno(tx);
     }
     return res.status(200).send('OK');
   } catch (error) {
-    console.error('webhook juno:', error);
+    // 500: Juno reintentará el webhook (p. ej. si su API falló o hay que ajustar src/verificacion.js)
+    console.error('webhook juno:', payload.id, error instanceof VerificacionError ? error.message : error);
     return res.status(500).send('Error interno');
   }
 });

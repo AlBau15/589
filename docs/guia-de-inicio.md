@@ -4,7 +4,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 
 ## Requisitos
 
-- Node.js 20.6 o superior (se usan `fetch`, `AbortSignal.timeout` y `--env-file` nativos).
+- Node.js 22.3 o superior (se usan `fetch`, `AbortSignal.timeout` y `--env-file` nativos, y los tests simulan módulos con `mock.module`).
 - PostgreSQL 13 o superior (`gen_random_uuid()` sin extensiones).
 - Cuentas y credenciales de:
   - **Privy** (autenticación y smart wallets con paymaster).
@@ -35,7 +35,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
    psql pagos -f db/schema.sql
    ```
 
-   Si ya tenías una base de datos con un esquema anterior, aplica en orden los archivos de `db/migraciones/` en lugar de `schema.sql`.
+   Si ya tenías una base de datos con un esquema anterior, aplica en orden los archivos de `db/migraciones/` que aún no tengas en lugar de `schema.sql`.
 
 4. Despliega `contracts/PagoAtomicoMXNB.sol` con Foundry siguiendo la guía del [contrato](contrato.md#despliegue).
 
@@ -51,7 +51,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 |----------|-----|
 | `PORT` | Puerto HTTP (por defecto `3000`). |
 | `DATABASE_URL` | Cadena de conexión a PostgreSQL. |
-| `TRUST_PROXY_HOPS` | Saltos de proxy de confianza; afecta a `req.ip` y a la lista blanca de IPs de Juno. |
+| `TRUST_PROXY_HOPS` | Número **exacto** de proxies inversos delante del servidor (por defecto `0`; `1` detrás de un balanceador). Un valor mayor que el real permite falsificar la IP con `X-Forwarded-For`, incluidas las de Juno. |
 | `EJECUTAR_TRABAJADORES` | `0` para arrancar solo la API, sin trabajadores en segundo plano. |
 | `ADMIN_API_SECRET` | Token Bearer de los endpoints de tesorería (`/api/tesoreria/*`). |
 | `PRIVY_APP_ID`, `PRIVY_APP_SECRET` | Credenciales de Privy. |
@@ -62,7 +62,7 @@ Esta guía explica cómo poner en marcha el orquestador de **589**.
 | `ORDEN_VIGENCIA_SEGUNDOS` | Tiempo para pagar una orden antes de que caduque en el contrato (por defecto `900`). |
 | `MXNB_ADDRESS`, `USDC_ADDRESS` | Opcionales: sobrescriben las direcciones de los tokens. |
 | `JUNO_BASE_URL`, `JUNO_ENTORNO` | Host de Juno y entorno (`stage` / `production`) para la lista de IPs de webhooks. |
-| `JUNO_API_KEY`, `JUNO_API_SECRET` | Credenciales HMAC de Juno/Bitso. |
+| `JUNO_API_KEY`, `JUNO_API_SECRET` | Credenciales HMAC de Juno/Bitso. La API key necesita el permiso *View account information* para verificar los webhooks. |
 | `JUNO_BEARER_TOKEN` | Opcional: cabecera `BitsoAuth` adicional. |
 | `JUNO_DEPOSIT_ADDRESS` | Dirección a la que el creador envía MXNB para retirar a México. |
 | `JUNO_LIMITE_TRAVEL_RULE_MXNB` | Opcional: monto a partir del cual un retiro exige datos de Travel Rule. |
@@ -99,7 +99,9 @@ Configura en los paneles de Juno y Bridge los webhooks hacia:
 | Síntoma | Causa probable |
 |---------|----------------|
 | `409 La smart wallet aún no está lista` en onboarding | Smart wallets o paymaster desactivados en el panel de Privy. |
-| `403 IP no permitida` en `/webhooks/juno` | `JUNO_ENTORNO` no coincide con el entorno, o `TRUST_PROXY_HOPS` mal configurado detrás de un proxy. |
+| `403 IP no permitida` en `/webhooks/juno` | `JUNO_ENTORNO` no coincide con el entorno, o `TRUST_PROXY_HOPS` no es el número de proxies delante del servidor. |
+| `500` en `/webhooks/juno` con *no incluye 'clabe'* (u otro campo) en el log | La respuesta de `GET /mint_platform/v1/transactions/{id}` usa otro nombre de campo: añádelo en `src/verificacion.js`. Juno reintenta el webhook, así que no se pierde. |
+| Un lote de `salidas_us` en `revision_manual` | El envío a Bridge falló sin certeza de si el USDC salió. Ver [arquitectura](arquitectura.md#envíos-a-bridge-nunca-dos-veces). |
 | `400 Firma inválida` en `/webhooks/bridge` | `BRIDGE_WEBHOOK_PUBLIC_KEY` incorrecta o reloj del servidor desfasado (> 10 min). |
 | `400` al iniciar una salida a EE. UU. | El lote es menor que el mínimo de Juno (25,000 MXNB). |
 

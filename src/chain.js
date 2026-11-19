@@ -67,28 +67,39 @@ export const saldoMxnb = (direccion) =>
 export const saldoUsdc = (direccion) =>
   publicClient.readContract({ address: USDC, abi: abiErc20, functionName: 'balanceOf', args: [direccion] });
 
-// Envía USDC nativo desde la wallet operativa de tesorería hacia la liquidation_address de Bridge
-export async function transferirUsdcTesoreria({ destino, montoMicro }) {
+// Ruta B, modo 'onchain_tesoreria'. El envío se separa en tres pasos para no enviar nunca dos veces:
+//   1) prepararEnvioUsdcTesoreria: validaciones sin mover dinero (se puede reintentar sin riesgo);
+//   2) enviarUsdcTesoreria: firma y emite la transferencia y devuelve el hash de inmediato, para guardarlo
+//      antes de esperar la confirmación;
+//   3) transaccionExitosa: espera el recibo.
+function clienteTesoreria() {
   if (!process.env.TESORERIA_USDC_PRIVATE_KEY) {
     throw new Error('Falta configurar TESORERIA_USDC_PRIVATE_KEY para transferir USDC a Bridge');
   }
-  const cuentaTesoreria = privateKeyToAccount(process.env.TESORERIA_USDC_PRIVATE_KEY);
-  const tesoreriaClient = createWalletClient({ account: cuentaTesoreria, chain: red, transport: transporte });
+  const cuenta = privateKeyToAccount(process.env.TESORERIA_USDC_PRIVATE_KEY);
+  return createWalletClient({ account: cuenta, chain: red, transport: transporte });
+}
 
-  const saldoActual = await saldoUsdc(cuentaTesoreria.address);
+export async function prepararEnvioUsdcTesoreria({ montoMicro }) {
+  const cliente = clienteTesoreria();
+  const saldoActual = await saldoUsdc(cliente.account.address);
   if (saldoActual < montoMicro) {
     throw new Error(`Saldo USDC insuficiente en tesorería (${saldoActual} < ${montoMicro})`);
   }
+}
 
-  const hash = await tesoreriaClient.writeContract({
+export function enviarUsdcTesoreria({ destino, montoMicro }) {
+  return clienteTesoreria().writeContract({
     address: USDC,
     abi: abiErc20,
     functionName: 'transfer',
     args: [norm(destino), montoMicro],
   });
+}
+
+export async function transaccionExitosa(hash) {
   const recibo = await publicClient.waitForTransactionReceipt({ hash });
-  if (recibo.status !== 'success') throw new Error('Transferencia USDC a Bridge revertida');
-  return hash;
+  return recibo.status === 'success';
 }
 
 export async function estadoOrden(orderId) {

@@ -124,7 +124,9 @@ export async function retirarUsdcExterno({ address, montoUsdc, chain = 'ARB', or
   if (process.env.BITSO_BRIDGE_CONTACT_ID) {
     payload.contact_id = process.env.BITSO_BRIDGE_CONTACT_ID;
   }
-  const r = await llamar('POST', '/v3/withdrawals', payload, { baseUrl: bitsoBase });
+  // origin_id y la clave de idempotencia son el id del lote: un reintento no crea un segundo retiro
+  // si Bitso los respeta. Aun así, procesarSalidasUs no reintenta errores ambiguos.
+  const r = await llamar('POST', '/v3/withdrawals', payload, { baseUrl: bitsoBase, idemKey: originId });
   return extraerId(r);
 }
 
@@ -134,4 +136,11 @@ export async function obtenerRetiroUsdcExterno(wid) {
   const r = await llamar('GET', `/v3/withdrawals/${encodeURIComponent(wid)}`, undefined, { baseUrl: bitsoBase });
   const p = Array.isArray(r.payload) ? r.payload[0] : r.payload;
   return { estado: p?.status ?? null, txHash: p?.details?.tx_hash ?? p?.tx_hash ?? null };
+}
+
+// Detalle de una transacción por su id (requiere el permiso "View account information" en la API key).
+// Los webhooks se tratan solo como aviso: lo que mueve dinero se toma de aquí.
+export async function obtenerTransaccion(id) {
+  const r = await llamar('GET', `/mint_platform/v1/transactions/${encodeURIComponent(id)}`);
+  return r.payload ?? r;
 }

@@ -17,7 +17,10 @@ import { deMicro, seguro } from './unidades.js';
 import { webhooks } from './webhooks.js';
 
 const app = express();
-app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+// Número de proxies inversos delante del servidor. Por defecto 0: no se confía en X-Forwarded-For,
+// que cualquier cliente puede falsificar. Pon el número exacto de proxies (p. ej. 1 detrás de un
+// balanceador); un valor mayor permitiría suplantar IPs, incluidas las de Juno.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 0));
 
 app.use(webhooks);
 app.use(express.json({ limit: '10kb' }));

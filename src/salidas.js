@@ -1,23 +1,31 @@
 // Rutas de salida
 //   A) México: MXNB de la wallet del creador -> Juno -> redención SPEI a su banco
 //   B) EE. UU.: tesorería MXNB -> USDC (Juno) -> Bridge -> ACH USD
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { getAddress } from 'viem';
 import * as bridge from './bridge.js';
 import * as chain from './chain.js';
 import * as db from './db.js';
 import * as juno from './juno.js';
+import { puedeReintentarse } from './errores.js';
 import { aMicro, deMicro, seguro } from './unidades.js';
 
 const MINIMO_REDENCION = 100_000_000n; // 100 MXNB
 const MINIMO_CONVERSION_USDC = 25_000_000_000n; // 25,000 MXNB
 
+// Comparación en tiempo constante para no filtrar el secreto por tiempos de respuesta
+function mismoSecreto(recibido, esperado) {
+  const a = Buffer.from(recibido);
+  const b = Buffer.from(esperado);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 // Middleware para proteger endpoints internos de tesorería (Ruta B)
 function autenticarAdmin(req, res, next) {
   const secret = process.env.ADMIN_API_SECRET;
-  const auth = req.headers.authorization?.replace('Bearer ', '');
-  if (!secret || auth !== secret) {
+  const auth = req.headers.authorization?.replace('Bearer ', '') ?? '';
+  if (!secret || !mismoSecreto(auth, secret)) {
     return res.status(401).json({ exito: false, error: 'No autorizado para operaciones de tesorería' });
   }
   next();
@@ -212,29 +220,50 @@ export async function convertirTesoreriaAUsdc(montoMxnb) {
   }
 }
 
-// Paso 2 (IMPLEMENTADO): Envía el USDC convertido hacia la dirección de liquidación de Bridge en Arbitrum.
-// Soporta dos modos configurables vía RUTA_B_MODO_RETIRO:
-//   - 'bitso_api' (por defecto): usa el endpoint institucional de retiros USDC de Bitso (/v3/withdrawals)
-//   - 'onchain_tesoreria': transfiere directamente desde la wallet operativa de tesorería en Arbitrum
-export async function enviarUsdcABridge(salida) {
+// Paso 2: envía el USDC convertido a la dirección de liquidación de Bridge en Arbitrum.
+// Modos (RUTA_B_MODO_RETIRO):
+//   - 'bitso_api' (por defecto): retiro de USDC de Bitso (/v3/withdrawals)
+//   - 'onchain_tesoreria': transferencia directa desde la wallet de tesorería en Arbitrum
+//
+// Regla para no enviar nunca dos veces: el identificador del envío (tx hash o id de retiro de Bitso) se
+// guarda en cuanto existe, y `ctx.envioIntentado` se activa justo antes de mover dinero. Si algo falla
+// después de ese punto sin un rechazo explícito, el lote va a 'revision_manual' en vez de reintentarse.
+export async function enviarUsdcABridge(salida, ctx = {}) {
   const cuentaBridge = await bridge.asegurarDireccionLiquidacion();
   const modo = process.env.RUTA_B_MODO_RETIRO ?? 'bitso_api';
 
   if (modo === 'onchain_tesoreria') {
-    const txHash = await chain.transferirUsdcTesoreria({
+    await chain.prepararEnvioUsdcTesoreria({ montoMicro: salida.montoUsdc });
+    ctx.envioIntentado = true;
+    const txHash = await chain.enviarUsdcTesoreria({
       destino: cuentaBridge.liquidationAddress,
       montoMicro: salida.montoUsdc,
     });
-    return { txHashBridge: txHash, bitsoWithdrawalId: null };
+    await db.actualizarSalidaUs(salida.id, { estado: 'enviado_bridge', tx_hash_bridge: txHash });
+
+    // El hash ya está guardado: a partir de aquí ningún error debe provocar un reintento.
+    try {
+      if (!(await chain.transaccionExitosa(txHash))) {
+        await db.actualizarSalidaUs(salida.id, {
+          estado: 'revision_manual',
+          detalle: { error: 'La transferencia de USDC a Bridge se revirtió en cadena', txHash },
+        });
+      }
+    } catch (error) {
+      // Sin recibo todavía: el lote queda en 'enviado_bridge' y lo cierra el webhook de Bridge.
+      console.warn('No se pudo confirmar la transferencia a Bridge, se revisará con el webhook:', salida.id, txHash, error);
+    }
+    return;
   }
 
+  ctx.envioIntentado = true;
   const bitsoWithdrawalId = await juno.retirarUsdcExterno({
     address: cuentaBridge.liquidationAddress,
     montoUsdc: deMicro(salida.montoUsdc),
     chain: 'ARB',
     originId: salida.id,
   });
-  return { txHashBridge: null, bitsoWithdrawalId };
+  await db.actualizarSalidaUs(salida.id, { estado: 'enviado_bridge', bitso_withdrawal_id: bitsoWithdrawalId });
 }
 
 // Trabajador asíncrono de Ruta B: reclama conversiones 'convertido' y las despacha a Bridge
@@ -242,16 +271,18 @@ export async function procesarSalidasUs() {
   for (;;) {
     const salida = await db.reclamarSalidaUs();
     if (!salida) break;
+    const ctx = { envioIntentado: false };
     try {
-      const { txHashBridge, bitsoWithdrawalId } = await enviarUsdcABridge(salida);
-      await db.actualizarSalidaUs(salida.id, {
-        estado: 'enviado_bridge',
-        tx_hash_bridge: txHashBridge,
-        bitso_withdrawal_id: bitsoWithdrawalId,
-      });
+      await enviarUsdcABridge(salida, ctx);
     } catch (error) {
-      console.error('envío USDC a Bridge falló:', salida.id, error.cuerpo ?? error);
-      await db.liberarSalidaUs(salida.id, { error: error.message, cuerpo: error.cuerpo ?? null });
+      const detalle = { error: error.message, cuerpo: error.cuerpo ?? null, envioIntentado: ctx.envioIntentado };
+      if (puedeReintentarse(error, ctx)) {
+        console.error('envío USDC a Bridge falló, se reintentará:', salida.id, error.cuerpo ?? error);
+        await db.liberarSalidaUs(salida.id, detalle);
+      } else {
+        console.error('envío USDC a Bridge en estado incierto, REVISAR A MANO antes de reintentar:', salida.id, error.cuerpo ?? error);
+        await db.marcarSalidaUsRevision(salida.id, detalle);
+      }
     }
   }
 }

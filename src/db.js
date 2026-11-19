@@ -238,7 +238,25 @@ export async function asignarDepositoCripto({ walletOrigen, monto, junoDepositoI
                    ORDER BY creado_en LIMIT 1 FOR UPDATE SKIP LOCKED)`,
     [walletOrigen, monto.toString(), junoDepositoId]
   );
-  return rowCount === 1 ? 'asignado' : null;
+  if (rowCount === 1) return 'asignado';
+
+  // El MXNB llegó después de que el retiro expirara (1 h): el creador ya envió el dinero, así que se
+  // reactiva el retiro más reciente que coincida (últimos 7 días) en vez de dejar los fondos varados.
+  // Si el usuario ya tiene otro retiro activo, el índice único lo impide y queda para revisión manual.
+  try {
+    const r = await q(
+      `UPDATE retiros_mx SET estado = 'en_juno', juno_deposito_id = $3, actualizado_en = now()
+        WHERE id = (SELECT id FROM retiros_mx
+                     WHERE estado = 'expirado' AND wallet_origen = $1 AND monto = $2
+                       AND juno_deposito_id IS NULL AND creado_en > now() - interval '7 days'
+                     ORDER BY creado_en DESC LIMIT 1 FOR UPDATE SKIP LOCKED)`,
+      [walletOrigen, monto.toString(), junoDepositoId]
+    );
+    return r.rowCount === 1 ? 'reactivado' : null;
+  } catch (error) {
+    if (error.code === '23505') return null;
+    throw error;
+  }
 }
 
 export async function reclamarRedencion() {
@@ -286,12 +304,15 @@ export async function recuperarAtascados() {
     `UPDATE retiros_mx SET estado = 'en_juno', actualizado_en = now()
      WHERE estado = 'redimiendo' AND juno_redencion_id IS NULL AND actualizado_en < now() - interval '5 minutes'`
   );
+  // Un lote atascado en 'enviando_bridge' pudo haber enviado el USDC antes de caerse el proceso:
+  // nunca se reintenta solo, se manda a revisión manual.
   await q(
-    `UPDATE salidas_us SET estado = 'convertido', actualizado_en = now()
-     WHERE estado = 'enviando_bridge'
-       AND bitso_withdrawal_id IS NULL
-       AND tx_hash_bridge IS NULL
-       AND actualizado_en < now() - interval '5 minutes'`
+    `UPDATE salidas_us
+        SET estado = 'revision_manual',
+            detalle = jsonb_build_object('error', 'Proceso interrumpido durante el envío a Bridge'),
+            actualizado_en = now()
+      WHERE estado = 'enviando_bridge'
+        AND actualizado_en < now() - interval '5 minutes'`
   );
 }
 
@@ -359,6 +380,13 @@ export const liberarSalidaUs = (id, detalleError = null) =>
             actualizado_en = now()
       WHERE id = $1 AND estado = 'enviando_bridge'`,
     [id, detalleError ? JSON.stringify(detalleError) : null]
+  );
+
+export const marcarSalidaUsRevision = (id, detalle) =>
+  q(
+    `UPDATE salidas_us SET estado = 'revision_manual', detalle = $2::jsonb, actualizado_en = now()
+      WHERE id = $1 AND estado = 'enviando_bridge'`,
+    [id, JSON.stringify(detalle)]
   );
 
 export async function listarSalidasUs(limite = 20) {

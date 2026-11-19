@@ -8,10 +8,10 @@
   "scripts": {
     "start": "node --env-file=.env src/servidor.js",
     "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done",
-    "test": "node --test test/backend/*.test.js"
+    "test": "node --test --experimental-test-module-mocks test/backend/*.test.js"
   },
   "engines": {
-    "node": ">=20.6"
+    "node": ">=22.3"
   },
   "dependencies": {
     "@privy-io/server-auth": "^1.32.5",

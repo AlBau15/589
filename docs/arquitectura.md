@@ -42,13 +42,15 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
     ├── servidor.js           # Punto de entrada: Express, órdenes, arranque de trabajadores
     ├── onboarding.js         # Alta: smart wallet, CLABE y registro de wallet en Juno
     ├── salidas.js            # Rutas A y B y sus trabajadores
-    ├── webhooks.js           # Webhooks de Juno (lista blanca de IPs) y Bridge (firma)
+    ├── webhooks.js           # Webhooks de Juno (verificados con su API) y Bridge (firma)
     ├── juno.js               # Cliente HMAC de Juno Mint Platform y retiros de Bitso
     ├── bridge.js             # Cliente de Bridge y verificación de webhooks
     ├── chain.js              # Acceso a Arbitrum con viem (contrato, MXNB, USDC)
     ├── firmas.js             # Firma EIP-712 de órdenes
     ├── db.js                 # Consultas SQL y máquinas de estado
-    └── unidades.js           # Conversión de montos a micro-unidades (BigInt)
+    ├── unidades.js           # Conversión de montos a micro-unidades (BigInt)
+    ├── verificacion.js       # Confirmación de webhooks de Juno contra su API
+    └── errores.js            # ¿Reintentar o revisión manual?
 ```
 
 ## Componentes principales
@@ -58,7 +60,9 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 | `servidor.js` | Autentica con Privy, aplica rate limit (10 req/min por usuario), firma órdenes (EIP-712) y devuelve las `calls` que envía el cliente. Reconcilia órdenes pendientes con el estado del contrato. |
 | `onboarding.js` | Toma un bloqueo optimista en `usuarios_perfil`, crea la CLABE en Juno, registra la smart wallet y marca el perfil como `completo`. Es idempotente y se puede reintentar. |
 | `salidas.js` | Ruta A (`/api/retiros/mx`) para creadores y Ruta B (`/api/tesoreria/salidas-us`) protegida con `ADMIN_API_SECRET`. |
-| `webhooks.js` | Guarda cada evento de Juno en `juno_transacciones` y avanza los estados de depósitos, retiros, redenciones y conversiones. Verifica la firma de los eventos de Bridge y cierra lotes ACH. |
+| `webhooks.js` | Trata cada webhook de Juno solo como aviso: consulta la transacción en la API de Juno (`verificacion.js`) y, con esos datos, avanza los estados de depósitos, retiros, redenciones y conversiones. Verifica la firma de los eventos de Bridge y cierra lotes ACH. |
+| `verificacion.js` | Extrae de la respuesta de Juno el tipo, el estado, el monto y los datos de destino; si falta alguno necesario, falla cerrada. |
+| `errores.js` | Decide si una operación que mueve dinero se puede reintentar o debe ir a revisión manual. |
 | `juno.js` | Firma cada llamada con HMAC-SHA256 (`nonce + método + ruta + cuerpo`) y envía `X-Idempotency-Key` cuando corresponde. |
 | `chain.js` | Lecturas y escrituras en Arbitrum: comisión y estado de órdenes, saldos, transferencias de USDC de tesorería y escucha de `CompraConfirmada`. |
 | `firmas.js` | Tipos, dominio y firma EIP-712 de órdenes; debe coincidir con `ORDEN_TYPEHASH` del contrato. |
@@ -85,11 +89,32 @@ Los usuarios se autentican con **Privy** y reciben una smart wallet (ERC-4337) e
 
 **Depósitos SPEI** (`depositos.estado`): `recibido` → `retirando` → `en_wallet` | `fallido`. Un depósito a una CLABE desconocida queda como `huerfano`.
 
-**Retiros a México** (`retiros_mx.estado`): `esperando_deposito` → `en_juno` → `redimiendo` → `completado` | `fallido`. Caduca a `expirado` si no llega el MXNB en 1 hora. Cada usuario solo puede tener un retiro activo.
+**Retiros a México** (`retiros_mx.estado`): `esperando_deposito` → `en_juno` → `redimiendo` → `completado` | `fallido`. Caduca a `expirado` si no llega el MXNB en 1 hora; si el MXNB llega después (hasta 7 días), el retiro se reactiva en vez de dejar los fondos varados en Juno. Cada usuario solo puede tener un retiro activo.
 
-**Salidas a EE. UU.** (`salidas_us.estado`): `cotizando` → `convirtiendo` → `convertido` → `enviando_bridge` → `enviado_bridge` → `completado_ach`, o `fallido`.
+**Salidas a EE. UU.** (`salidas_us.estado`): `cotizando` → `convirtiendo` → `convertido` → `enviando_bridge` → `enviado_bridge` → `completado_ach`, o `fallido` / `revision_manual`.
 
-Los reintentos suben `intentos`; tras 5 fallos la fila pasa a `fallido`. Las filas atascadas en un estado intermedio sin id externo durante más de 5 minutos se devuelven a la cola.
+Los reintentos suben `intentos`; tras 5 fallos la fila pasa a `fallido`. Los depósitos y redenciones atascados sin id externo durante más de 5 minutos se devuelven a la cola (son seguros de reintentar porque usan claves de idempotencia de Juno).
+
+### Envíos a Bridge: nunca dos veces
+
+El envío de USDC a Bridge no se reintenta si hay duda de que el dinero haya salido:
+
+- El tx hash (modo on-chain) o el id del retiro de Bitso se guarda en cuanto existe, antes de esperar confirmación.
+- Un fallo **antes** de mover dinero (sin saldo, sin dirección de Bridge) vuelve a la cola.
+- Un fallo **después** de intentarlo solo se reintenta si el proveedor lo rechazó explícitamente (HTTP 4xx salvo 408/409). Timeouts, errores de red, 5xx, una transacción revertida o un proceso interrumpido llevan el lote a **`revision_manual`**, con el error en `detalle`.
+
+Para resolver un lote en `revision_manual`, comprueba en Arbiscan (dirección de tesorería) o en Bitso si el USDC salió:
+
+```sql
+-- Salió: guarda la referencia y deja que el webhook de Bridge lo cierre
+UPDATE salidas_us SET estado = 'enviado_bridge', tx_hash_bridge = '0x...' WHERE id = '<id>' AND estado = 'revision_manual';
+-- No salió: devuélvelo a la cola
+UPDATE salidas_us SET estado = 'convertido' WHERE id = '<id>' AND estado = 'revision_manual';
+```
+
+### Webhooks de Juno
+
+Un webhook solo indica que hay que revisar una transacción. El backend la consulta con `GET /mint_platform/v1/transactions/{id}` (la API key necesita el permiso *View account information*) y usa el tipo, el estado, el monto, la CLABE y la dirección de origen de esa respuesta, nunca del cuerpo del webhook. Si Juno no conoce el id, se responde 404; si falta un dato necesario, 500 para que Juno reintente. La lista blanca de IPs se mantiene como segunda barrera y depende de `TRUST_PROXY_HOPS`.
 
 ## Trabajadores en segundo plano
 

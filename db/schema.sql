@@ -1,4 +1,4 @@
--- Esquema v2.2 (Arbitrum + Juno + Bridge Ruta B completa + órdenes firmadas EIP-712). Montos en unidades mínimas (6 decimales).
+-- Esquema v2.3 (Arbitrum + Juno + Bridge Ruta B completa + órdenes firmadas EIP-712 + revisión manual de envíos). Montos en unidades mínimas (6 decimales).
 
 CREATE TABLE usuarios_perfil (
   user_id                   TEXT PRIMARY KEY,                -- userId de Privy
@@ -98,6 +98,7 @@ CREATE TABLE salidas_us (
                         'enviando_bridge',
                         'enviado_bridge',
                         'completado_ach',
+                        'revision_manual',                    -- envío incierto: no se reintenta solo
                         'fallido'
                       )),
   juno_quote_id       TEXT,

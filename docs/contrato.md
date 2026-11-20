@@ -129,6 +129,8 @@ Sirve para comprobar el contrato desplegado con una compra real: el comprador pa
 
    El script comprueba que la clave es la del operador del contrato y muestra los valores para los pasos siguientes.
 
+   **Sin instalar nada:** lanza **Actions → Firmar orden de prueba (Arbitrum Sepolia) → Run workflow** con el comprador, el creador y el monto. Usa el secret `OPERADOR_PRIVATE_KEY` del environment `arbitrum-sepolia` (o `DEPLOYER_PRIVATE_KEY` si es la misma wallet) y deja la orden y la firma en el resumen del job.
+
 2. **Aprueba el MXNB** en Remix, desde la cuenta del comprador. Crea un archivo con `import "@openzeppelin/contracts@5.6.1/token/ERC20/IERC20.sol";`, compílalo, elige `IERC20` en *Contract*, pon la dirección de MXNB (`0x82B9e52b26A2954E113F94Ff26647754d5a4247D`) en **At Address** y llama a `approve` con los valores del paso 1.
 
 3. **Paga**: elige `PagoAtomicoMXNB`, pon la dirección del contrato en **At Address**, abre `pagarOrden` y pega `orden` y `firma` tal como los imprimió el script. Confirma en la wallet.

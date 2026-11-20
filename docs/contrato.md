@@ -115,6 +115,28 @@ Antes de desplegar, el workflow comprueba que la RPC responde y es Arbitrum Sepo
 
 Para mainnet, despliega a mano con el owner en un multisig y después de la auditoría.
 
+## Probar una compra en testnet (sin backend)
+
+Sirve para comprobar el contrato desplegado con una compra real: el comprador paga, el creador recibe el 95 % y la tesorería el 5 %.
+
+**Necesitas:** el repositorio clonado con `npm install`, un `.env` con `OPERADOR_PRIVATE_KEY` (la clave del operador del contrato), y en la wallet del comprador ETH y MXNB de Arbitrum Sepolia. El MXNB de prueba se pide en el [faucet de Juno](https://buildwithjuno.com/en-US/faucet).
+
+1. **Firma la orden** con la clave del operador. No se imprime ni se envía a ningún sitio:
+
+   ```bash
+   node --env-file=.env scripts/firmar-orden.mjs <contrato> <comprador> <creador> <montoMXNB> [minutos]
+   ```
+
+   El script comprueba que la clave es la del operador del contrato y muestra los valores para los pasos siguientes.
+
+2. **Aprueba el MXNB** en Remix, desde la cuenta del comprador. Crea un archivo con `import "@openzeppelin/contracts@5.6.1/token/ERC20/IERC20.sol";`, compílalo, elige `IERC20` en *Contract*, pon la dirección de MXNB (`0x82B9e52b26A2954E113F94Ff26647754d5a4247D`) en **At Address** y llama a `approve` con los valores del paso 1.
+
+3. **Paga**: elige `PagoAtomicoMXNB`, pon la dirección del contrato en **At Address**, abre `pagarOrden` y pega `orden` y `firma` tal como los imprimió el script. Confirma en la wallet.
+
+4. **Comprueba** en Arbiscan la transacción: en *ERC-20 Tokens Transferred* deben aparecer dos movimientos de MXNB (creador y tesorería) y, en *Logs*, el evento `CompraConfirmada`. `estados(orderId)` devuelve `1` (pagada).
+
+5. **Prueba de protección:** vuelve a llamar a `pagarOrden` con los mismos valores. Remix avisa de que la transacción revertiría con `OrdenNoPagable`: la misma orden no se puede pagar dos veces.
+
 ## Antes de producción
 
 - Owner en un **multisig**, no en una wallet individual.
